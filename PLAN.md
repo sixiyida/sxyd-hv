@@ -128,3 +128,12 @@
 - 配置/开关：编译时或运行时切换 VMCALL vs 队列通路。
 - 文档：握手协议、队列格式、命令列表、错误码、调优参数与测试指引。
 
+当前完成进展（本迭代）
+--------------------
+- HV/R3 握手通路落地：CPUID 0x1337 注册队列，CR3 级上下文 + 页帧缓存，异常时自动失效旧队列。
+- 队列结构与协议：SPSC header + 64B 对齐条目（cmd/status/cr3/gva/gpa/size/flags/aux），内核/用户态同步定义。
+- 队列消费：HV 在 vm-exit 后批量处理（上限 4 条），处理日志可见；翻译失败 err_translate，未实现 err_unimplemented。
+- 已支持命令：nop、read_phys、write_phys，跨页 gva2hva + memcpy_safe，完成后 status=done，aux=已处理字节数。
+- 用户态验证：握手后提交 NOP + read_phys 示例，读取 HV 基址物理页成功（数据校验与日志均正常）。
+- 日志与调试：HV logger 默认开启，UM 循环 flush；异常握手可抓取日志；防止旧队列刷屏的自动失效机制。
+

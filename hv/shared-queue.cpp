@@ -3,6 +3,8 @@
 #include "logger.h"
 #include "vcpu.h"
 #include "vmx.h"
+#include "page-tables.h"
+#include "exception-routines.h"
 
 namespace hv {
 
@@ -166,11 +168,71 @@ void process_shared_queue(vcpu* const /*cpu*/) {
     case shared_queue_cmd::nop:
       entry->status = static_cast<uint32_t>(shared_queue_entry_status::done);
       break;
+
+    case shared_queue_cmd::read_phys: {
+      auto const gpa  = entry->gpa;
+      auto const size = static_cast<size_t>(entry->size);
+      auto* const dst = reinterpret_cast<uint8_t*>(entry->gva);
+
+      size_t copied = 0;
+      while (copied < size) {
+        size_t dst_remaining = 0;
+        auto* curr_dst = reinterpret_cast<uint8_t*>(
+          gva2hva(guest_cr3, dst + copied, &dst_remaining));
+        if (!curr_dst) {
+          entry->status = static_cast<uint32_t>(shared_queue_entry_status::err_translate);
+          goto done_entry;
+        }
+        size_t const curr_size = (dst_remaining < (size - copied))
+          ? dst_remaining
+          : (size - copied);
+        host_exception_info e;
+        memcpy_safe(e, curr_dst, host_physical_memory_base + gpa + copied, curr_size);
+        if (e.exception_occurred) {
+          entry->status = static_cast<uint32_t>(shared_queue_entry_status::err_translate);
+          goto done_entry;
+        }
+        copied += curr_size;
+      }
+      entry->aux    = size;
+      entry->status = static_cast<uint32_t>(shared_queue_entry_status::done);
+    } break;
+
+    case shared_queue_cmd::write_phys: {
+      auto const gpa  = entry->gpa;
+      auto const size = static_cast<size_t>(entry->size);
+      auto const* src = reinterpret_cast<uint8_t const*>(entry->gva);
+
+      size_t copied = 0;
+      while (copied < size) {
+        size_t src_remaining = 0;
+        auto const* curr_src = reinterpret_cast<uint8_t const*>(
+          gva2hva(guest_cr3, const_cast<uint8_t*>(src + copied), &src_remaining));
+        if (!curr_src) {
+          entry->status = static_cast<uint32_t>(shared_queue_entry_status::err_translate);
+          goto done_entry;
+        }
+        size_t const curr_size = (src_remaining < (size - copied))
+          ? src_remaining
+          : (size - copied);
+        host_exception_info e;
+        memcpy_safe(e, host_physical_memory_base + gpa + copied, curr_src, curr_size);
+        if (e.exception_occurred) {
+          entry->status = static_cast<uint32_t>(shared_queue_entry_status::err_translate);
+          goto done_entry;
+        }
+        copied += curr_size;
+      }
+      entry->aux    = size;
+      entry->status = static_cast<uint32_t>(shared_queue_entry_status::done);
+    } break;
+
     default:
       entry->status = static_cast<uint32_t>(shared_queue_entry_status::err_unimplemented);
       break;
     }
 
+done_entry:
     HV_LOG_INFO("[sq] processed idx=%u cmd=%u status=%u cr3=%p gva=%p gpa=%p size=0x%X",
       idx,
       entry->cmd,

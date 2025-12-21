@@ -112,6 +112,22 @@ int main() {
   auto const hv_base = static_cast<uint8_t*>(hv::get_hv_base());
   auto const hv_size = 0x64000;
 
+  // 4) 提交一个 read_phys 测试：读 HV 基址物理地址的一小段到共享缓冲区
+  uint64_t hv_phys = hv::get_physical_address(0, hv_base);
+  auto* read_buf = reinterpret_cast<uint8_t*>(qent + 2); // 放在队列区域后面作为目标缓冲
+  ZeroMemory(read_buf, 0x80);
+
+  ZeroMemory(&qent[1], sizeof(hv::shared_queue_entry));
+  qent[1].cmd    = static_cast<uint32_t>(hv::shared_queue_cmd::read_phys);
+  qent[1].status = static_cast<uint32_t>(hv::shared_queue_entry_status::pending);
+  qent[1].gpa    = hv_phys;
+  qent[1].gva    = reinterpret_cast<uint64_t>(read_buf);
+  qent[1].size   = 0x40;
+
+  _mm_mfence();
+  qhdr->head = 2; // 发布两个条目
+  _mm_mfence();
+
   // hide the hypervisor
   size_t hide_fail = 0;
   hv::for_each_cpu([&](uint32_t) {
@@ -160,12 +176,24 @@ int main() {
 
     // 轮询检查 tail 是否前进，验证 NOP 已被消费
     static bool entry0_reported = false;
+    static bool entry1_reported = false;
     auto const tail = qhdr->tail;
     if (!entry0_reported &&
         tail > 0 &&
         qent[0].status == static_cast<uint32_t>(hv::shared_queue_entry_status::done)) {
       printf("[um] queue entry 0 done, tail=%u\n", tail);
       entry0_reported = true;
+    }
+    if (!entry1_reported &&
+        tail > 1 &&
+        qent[1].status == static_cast<uint32_t>(hv::shared_queue_entry_status::done)) {
+      printf("[um] queue entry 1 done (read_phys) tail=%u size=%u\n", tail, qent[1].size);
+      printf("[um] read_phys buffer (first 32 bytes):\n  ");
+      for (size_t i = 0; i < 32; ++i) {
+        printf("%02X ", read_buf[i]);
+      }
+      printf("\n");
+      entry1_reported = true;
     }
 
     Sleep(200);
