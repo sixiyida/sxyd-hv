@@ -1,4 +1,4 @@
-#include "logger.h"
+﻿#include "logger.h"
 #include "hv.h"
 
 #include <ntstrsafe.h>
@@ -40,7 +40,7 @@ void logger_flush(uint32_t& count, logger_msg* const buffer) {
 
 /**
  * C++ version 0.4 char* style "itoa":
- * Written by Luk�s Chmela
+ * Written by Luk醩 Chmela
  * Released under GPLv3.
  * https://stackoverflow.com/a/23840699
  */
@@ -224,4 +224,3 @@ void logger_write(char const* const format, ...) {
 }
 
 } // namespace hv
-

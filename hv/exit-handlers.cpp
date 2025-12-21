@@ -7,11 +7,41 @@
 #include "vmx.h"
 #include "logger.h"
 #include "hv.h"
+#include "shared-queue.h"
 
 namespace hv {
 
 void emulate_cpuid(vcpu* const cpu) {
   auto const ctx = cpu->ctx;
+
+  if (ctx->eax == shared_queue_cpuid_leaf &&
+      ctx->ecx == shared_queue_cpuid_subleaf_handshake) {
+    cr3 guest_cr3;
+    guest_cr3.flags = vmx_vmread(VMCS_GUEST_CR3);
+
+    shared_queue_register_request req{};
+    req.queue_gva  = ctx->rbx;
+    req.queue_size = static_cast<uint32_t>(ctx->r8);
+    req.magic      = ctx->rdx;
+    req.seed       = ctx->r9;
+
+    HV_LOG_INFO("[sq] cpuid handshake: cr3=%p gva=%p size=0x%X magic=%p seed=%p",
+      guest_cr3.flags, req.queue_gva, req.queue_size, req.magic, req.seed);
+
+    auto const res = register_shared_queue(guest_cr3, req);
+
+    HV_LOG_INFO("[sq] cpuid result: status=%u pages=%u magic=%p",
+      static_cast<uint32_t>(res.status), res.page_count, req.magic);
+
+    ctx->rax = hypervisor_signature;
+    ctx->rbx = static_cast<uint64_t>(res.status);
+    ctx->rcx = res.page_count;
+    ctx->rdx = req.magic;
+
+    cpu->hide_vm_exit_overhead = true;
+    skip_instruction();
+    return;
+  }
 
   int regs[4];
   __cpuidex(regs, ctx->eax, ctx->ecx);
@@ -219,7 +249,9 @@ void emulate_vmcall(vcpu* const cpu) {
 }
 
 void handle_vmx_preemption(vcpu*) {
-  // do nothing.
+  // 轮询共享队列（基于 VMX preemption timer）
+  // 注意：处理逻辑批量/有限次，避免占用过久
+  process_shared_queue(nullptr);
 }
 
 void emulate_mov_to_cr0(vcpu* const cpu, uint64_t const gpr) {

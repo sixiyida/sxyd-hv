@@ -15,4 +15,35 @@
   ret
 ?vmx_vmcall@hv@@YA_KAEAUhypercall_input@1@@Z endp
 
+; void __fastcall hv_queue_handshake_asm(queue_handshake_request const* req, queue_handshake_raw_response* resp)
+hv_queue_handshake_asm proc
+  ; rcx = req, rdx = resp
+  push rbx
+  push rsi
+  push rdi
+
+  mov rdi, rdx                ; resp
+  mov r10, rcx                ; save req pointer to r10
+
+  mov rax, 1337h              ; leaf
+  mov rbx, [r10]              ; queue VA
+  mov rdx, [r10 + 10h]        ; magic
+  mov r8d, [r10 + 8]          ; size (zero-extend)
+  mov r9,  [r10 + 18h]        ; seed
+  
+  xor ecx, ecx                ; subleaf = 0 (clobbers rcx, so we used r10)
+  
+  cpuid
+
+  mov [rdi], rax
+  mov [rdi + 8], rbx
+  mov [rdi + 10h], rcx
+  mov [rdi + 18h], rdx
+
+  pop rdi
+  pop rsi
+  pop rbx
+  ret
+hv_queue_handshake_asm endp
+
 end

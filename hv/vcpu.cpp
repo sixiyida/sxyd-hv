@@ -9,6 +9,7 @@
 #include "exit-handlers.h"
 #include "exception-routines.h"
 #include "introspection.h"
+#include "shared-queue.h"
 
 // first byte at the start of the image
 extern "C" uint8_t __ImageBase;
@@ -238,6 +239,9 @@ bool handle_vm_exit(guest_context* const ctx) {
   cpu->stop_virtualization   = false;
 
   dispatch_vm_exit(cpu, reason);
+
+  // 处理共享队列（批量有限，开销低），确保至少每次 vm-exit 都有机会消费
+  process_shared_queue(cpu);
 
   vmentry_interrupt_information interrupt_info;
   interrupt_info.flags = static_cast<uint32_t>(

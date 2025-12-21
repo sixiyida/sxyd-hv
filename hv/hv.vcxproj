@@ -135,6 +135,7 @@
     <ClInclude Include="mm.h" />
     <ClInclude Include="mtrr.h" />
     <ClInclude Include="page-tables.h" />
+    <ClInclude Include="shared-queue.h" />
     <ClInclude Include="segment.h" />
     <ClInclude Include="spin-lock.h" />
     <ClInclude Include="timing.h" />
@@ -156,6 +157,7 @@
     <ClCompile Include="mm.cpp" />
     <ClCompile Include="mtrr.cpp" />
     <ClCompile Include="page-tables.cpp" />
+    <ClCompile Include="shared-queue.cpp" />
     <ClCompile Include="segment.cpp" />
     <ClCompile Include="timing.cpp" />
     <ClCompile Include="vcpu.cpp" />
@@ -180,11 +182,17 @@
       <FileDigestAlgorithm>SHA256</FileDigestAlgorithm>
       <TestSign>true</TestSign>
     </DriverSign>
+    <ClCompile>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <DriverSign>
       <FileDigestAlgorithm>SHA256</FileDigestAlgorithm>
       <TestSign>true</TestSign>
     </DriverSign>
+    <ClCompile>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
   </ItemDefinitionGroup>
 </Project>

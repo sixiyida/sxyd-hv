@@ -49,6 +49,84 @@ enum hypercall_code : uint64_t {
   hypercall_remove_all_mmrs
 };
 
+// CPUID 握手叶子（共享队列注册）
+inline constexpr uint32_t shared_queue_cpuid_leaf              = 0x1337;
+inline constexpr uint32_t shared_queue_cpuid_subleaf_handshake = 0;
+
+// 队列命令与状态（需与内核侧保持一致）
+enum class shared_queue_cmd : uint32_t {
+  nop = 0,
+  read_phys,
+  write_phys,
+  read_virt,
+  write_virt,
+};
+
+enum class shared_queue_entry_status : uint32_t {
+  pending           = 0,
+  done              = 1,
+  err_unimplemented = 0x80000001,
+  err_translate     = 0x80000002,
+};
+
+struct shared_queue_header {
+  uint32_t head;
+  uint32_t tail;
+  uint32_t reserved0;
+  uint32_t reserved1;
+};
+
+struct alignas(64) shared_queue_entry {
+  uint32_t cmd;         // shared_queue_cmd
+  uint32_t status;      // shared_queue_entry_status
+  uint64_t cr3;         // 目标 CR3（可选）
+  uint64_t gva;         // 虚拟地址
+  uint64_t gpa;         // 物理地址（可选）
+  uint32_t size;        // 操作尺寸
+  uint32_t flags;       // 扩展标志
+  uint64_t aux;         // 额外参数/返回值
+  uint64_t reserved;    // 保留
+};
+static_assert(sizeof(shared_queue_entry) == 64, "shared_queue_entry size");
+
+inline shared_queue_header* sq_header(void* queue) {
+  return reinterpret_cast<shared_queue_header*>(queue);
+}
+
+inline shared_queue_entry* sq_entries(void* queue) {
+  return reinterpret_cast<shared_queue_entry*>(
+    reinterpret_cast<uint8_t*>(queue) + sizeof(shared_queue_header));
+}
+
+enum class queue_register_status : uint32_t {
+  success = 0,
+  invalid_size,
+  too_many_pages,
+  translation_failed,
+  registry_full,
+};
+
+struct queue_handshake_request {
+  void*    queue;
+  uint32_t size;
+  uint64_t magic;
+  uint64_t seed;
+};
+
+struct queue_handshake_raw_response {
+  uint64_t rax;
+  uint64_t rbx;
+  uint64_t rcx;
+  uint64_t rdx;
+};
+
+struct queue_handshake_result {
+  uint64_t             signature;
+  queue_register_status status;
+  uint32_t             page_count;
+  uint64_t             echoed_magic;
+};
+
 // hypercall input
 struct hypercall_input {
   // rax
@@ -129,6 +207,23 @@ void remove_all_mmrs();
 
 // VMCALL instruction, defined in hv.asm
 uint64_t vmx_vmcall(hypercall_input& input);
+
+// CPUID 握手，用于注册共享队列（定义在 hv.asm）
+extern "C" void __fastcall hv_queue_handshake_asm(
+  queue_handshake_request const* req,
+  queue_handshake_raw_response*  resp);
+
+inline queue_handshake_result queue_handshake(queue_handshake_request const& req) {
+  queue_handshake_raw_response raw{};
+  hv_queue_handshake_asm(&req, &raw);
+
+  queue_handshake_result res{};
+  res.signature   = raw.rax;
+  res.status      = static_cast<queue_register_status>(raw.rbx);
+  res.page_count  = static_cast<uint32_t>(raw.rcx);
+  res.echoed_magic = raw.rdx;
+  return res;
+}
 
 /**
 * 
