@@ -20,6 +20,9 @@ void ping(vcpu* const cpu) {
 
 // a hypercall for quick testing
 void test(vcpu* const cpu) {
+#if defined(HV_NO_LOG)
+  UNREFERENCED_PARAMETER(cpu);
+#endif
   char image_name[16];
   current_guest_image_file_name(image_name);
 

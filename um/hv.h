@@ -208,6 +208,16 @@ void remove_all_mmrs();
 // VMCALL instruction, defined in hv.asm
 uint64_t vmx_vmcall(hypercall_input& input);
 
+namespace detail {
+inline uint64_t vmx_vmcall_safe(hypercall_input& input) {
+  __try {
+    return hv::vmx_vmcall(input);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return 0;
+  }
+}
+} // namespace detail
+
 // CPUID 握手，用于注册共享队列（定义在 hv.asm）
 extern "C" void __fastcall hv_queue_handshake_asm(
   queue_handshake_request const* req,
@@ -234,7 +244,11 @@ inline queue_handshake_result queue_handshake(queue_handshake_request const& req
 // check if the system is virtualized
 inline bool is_hv_running() {
   __try {
-    return hv::ping() == hv::hypervisor_signature;
+    hv::queue_handshake_request req{};
+    req.queue = nullptr;
+    req.size  = 0;
+    auto const res = hv::queue_handshake(req);
+    return res.signature == hv::hypervisor_signature;
   } __except (1) {}
 
   return false;
@@ -258,7 +272,7 @@ inline uint64_t ping() {
   hv::hypercall_input input;
   input.code = hv::hypercall_ping;
   input.key  = hv::hypercall_key;
-  return hv::vmx_vmcall(input);
+  return hv::detail::vmx_vmcall_safe(input);
 }
 
 // a hypercall for quick testing
@@ -274,7 +288,7 @@ inline uint64_t test(uint64_t const a1, uint64_t const a2,
   input.args[3] = a4;
   input.args[4] = a5;
   input.args[5] = a6;
-  return hv::vmx_vmcall(input);
+  return hv::detail::vmx_vmcall_safe(input);
 }
 
 // read from arbitrary physical memory
@@ -286,7 +300,7 @@ inline size_t read_phys_mem(void* const dst, uint64_t const src,
   input.args[0] = reinterpret_cast<uint64_t>(dst);
   input.args[1] = src;
   input.args[2] = size;
-  return hv::vmx_vmcall(input);
+  return hv::detail::vmx_vmcall_safe(input);
 }
 
 // write to arbitrary physical memory
@@ -298,7 +312,7 @@ inline size_t write_phys_mem(uint64_t const dst, void const* const src,
   input.args[0] = dst;
   input.args[1] = reinterpret_cast<uint64_t>(src);
   input.args[2] = size;
-  return hv::vmx_vmcall(input);
+  return hv::detail::vmx_vmcall_safe(input);
 }
 
 // read from virtual memory in another process
@@ -311,7 +325,7 @@ inline size_t read_virt_mem(uint64_t const cr3, void* const dst,
   input.args[1] = reinterpret_cast<uint64_t>(dst);
   input.args[2] = reinterpret_cast<uint64_t>(src);
   input.args[3] = size;
-  return hv::vmx_vmcall(input);
+  return hv::detail::vmx_vmcall_safe(input);
 }
 
 // write to virtual memory in another process
@@ -324,7 +338,7 @@ inline size_t write_virt_mem(uint64_t const cr3, void* const dst,
   input.args[1] = reinterpret_cast<uint64_t>(dst);
   input.args[2] = reinterpret_cast<uint64_t>(src);
   input.args[3] = size;
-  return hv::vmx_vmcall(input);
+  return hv::detail::vmx_vmcall_safe(input);
 }
 
 // get the kernel CR3 value of an arbitrary process
@@ -333,7 +347,7 @@ inline uint64_t query_process_cr3(uint64_t const pid) {
   input.code    = hv::hypercall_query_process_cr3;
   input.key     = hv::hypercall_key;
   input.args[0] = pid;
-  return hv::vmx_vmcall(input);
+  return hv::detail::vmx_vmcall_safe(input);
 }
 
 // install an EPT hook for the CURRENT logical processor ONLY
@@ -343,7 +357,7 @@ inline bool install_ept_hook(uint64_t const orig_page_pfn, uint64_t const exec_p
   input.key     = hv::hypercall_key;
   input.args[0] = orig_page_pfn;
   input.args[1] = exec_page_pfn;
-  return hv::vmx_vmcall(input);
+  return hv::detail::vmx_vmcall_safe(input);
 }
 
 // remove a previously installed EPT hook
@@ -352,7 +366,7 @@ inline void remove_ept_hook(uint64_t const orig_page_pfn) {
   input.code    = hv::hypercall_remove_ept_hook;
   input.key     = hv::hypercall_key;
   input.args[0] = orig_page_pfn;
-  hv::vmx_vmcall(input);
+  hv::detail::vmx_vmcall_safe(input);
 }
 
 // flush the hypervisor logs into a buffer
@@ -362,7 +376,7 @@ inline void flush_logs(uint32_t& count, logger_msg* const msgs) {
   input.key     = hv::hypercall_key;
   input.args[0] = count;
   input.args[1] = reinterpret_cast<uint64_t>(msgs);
-  count = static_cast<uint32_t>(hv::vmx_vmcall(input));
+  count = static_cast<uint32_t>(hv::detail::vmx_vmcall_safe(input));
 }
 
 // translate a virtual address to its physical address
@@ -372,7 +386,7 @@ inline uint64_t get_physical_address(uint64_t const cr3, void const* const addre
   input.key     = hv::hypercall_key;
   input.args[0] = cr3;
   input.args[1] = reinterpret_cast<uint64_t>(address);
-  return hv::vmx_vmcall(input);
+  return hv::detail::vmx_vmcall_safe(input);
 }
 
 // hide a physical page from the guest
@@ -381,7 +395,7 @@ inline bool hide_physical_page(uint64_t const pfn) {
   input.code    = hv::hypercall_hide_physical_page;
   input.key     = hv::hypercall_key;
   input.args[0] = pfn;
-  return hv::vmx_vmcall(input);
+  return hv::detail::vmx_vmcall_safe(input);
 }
 
 // unhide a physical page from the guest
@@ -390,7 +404,7 @@ inline void unhide_physical_page(uint64_t const pfn) {
   input.code    = hv::hypercall_unhide_physical_page;
   input.key     = hv::hypercall_key;
   input.args[0] = pfn;
-  hv::vmx_vmcall(input);
+  hv::detail::vmx_vmcall_safe(input);
 }
 
 // get the base address of the hypervisor
@@ -398,7 +412,7 @@ inline void* get_hv_base() {
   hv::hypercall_input input;
   input.code = hv::hypercall_get_hv_base;
   input.key  = hv::hypercall_key;
-  return reinterpret_cast<void*>(hv::vmx_vmcall(input));
+  return reinterpret_cast<void*>(hv::detail::vmx_vmcall_safe(input));
 }
 
 // write to the logger whenever a certain physical memory range is accessed
@@ -410,7 +424,7 @@ inline void* install_mmr(uint64_t const address, uint32_t const size,
   input.args[0] = address;
   input.args[1] = size;
   input.args[2] = mode;
-  return reinterpret_cast<void*>(hv::vmx_vmcall(input));
+  return reinterpret_cast<void*>(hv::detail::vmx_vmcall_safe(input));
 }
 
 // remove an existing MMR
@@ -419,7 +433,7 @@ inline void remove_mmr(void* const handle) {
   input.code = hv::hypercall_remove_mmr;
   input.key  = hv::hypercall_key;
   input.args[0] = reinterpret_cast<uint64_t>(handle);
-  hv::vmx_vmcall(input);
+  hv::detail::vmx_vmcall_safe(input);
 }
 
 // remove every installed MMR
@@ -427,7 +441,7 @@ inline void remove_all_mmrs() {
   hv::hypercall_input input;
   input.code = hv::hypercall_remove_all_mmrs;
   input.key  = hv::hypercall_key;
-  hv::vmx_vmcall(input);
+  hv::detail::vmx_vmcall_safe(input);
 }
 
 } // namespace hv

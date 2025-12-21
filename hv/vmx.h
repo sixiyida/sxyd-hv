@@ -4,6 +4,8 @@
 #include "guest-context.h"
 #include "hypercalls.h"
 
+#define HV_NO_VMCALL
+
 namespace hv {
 
 // TODO: move to ia32?

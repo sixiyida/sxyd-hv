@@ -22,6 +22,11 @@ struct hypervisor {
   // dynamically allocated array of vcpus
   unsigned long vcpu_count;
   struct vcpu* vcpus;
+  uint32_t pool_tag;
+
+  // stop/devirtualization coordination (no VMCALL path)
+  volatile LONG stop_requested;
+  volatile LONG stopped_cpu_count;
 
   // pointer to the System process
   uint8_t* system_eprocess;

@@ -104,6 +104,9 @@ struct vcpu {
 
   // whether to devirtualize the current VCPU
   bool stop_virtualization;
+
+  // used to ensure we only count the stop once per vcpu
+  bool stop_notified;
 };
 
 // virtualize the specified cpu. this assumes that execution is already

@@ -197,7 +197,7 @@ static void dispatch_vm_exit(vcpu* const cpu, vmx_vmexit_reason const reason) {
   case VMX_EXIT_REASON_EXECUTE_WRMSR:                emulate_wrmsr(cpu);               break;
   case VMX_EXIT_REASON_EXECUTE_XSETBV:               emulate_xsetbv(cpu);              break;
   case VMX_EXIT_REASON_EXECUTE_VMXON:                emulate_vmxon(cpu);               break;
-  case VMX_EXIT_REASON_EXECUTE_VMCALL:               emulate_vmcall(cpu);              break;
+  case VMX_EXIT_REASON_EXECUTE_VMCALL:               handle_vmcall(cpu);               break;
   case VMX_EXIT_REASON_VMX_PREEMPTION_TIMER_EXPIRED: handle_vmx_preemption(cpu);       break;
   case VMX_EXIT_REASON_EPT_VIOLATION:                handle_ept_violation(cpu);        break;
   case VMX_EXIT_REASON_EXECUTE_RDTSC:                emulate_rdtsc(cpu);               break;
@@ -239,7 +239,17 @@ bool handle_vm_exit(guest_context* const ctx) {
   cpu->hide_vm_exit_overhead = false;
   cpu->stop_virtualization   = false;
 
-  dispatch_vm_exit(cpu, reason);
+  // devirtualize request (no VMCALL path)
+  if (ghv.stop_requested) {
+    cpu->stop_virtualization = true;
+    if (!cpu->stop_notified) {
+      cpu->stop_notified = true;
+      InterlockedIncrement(const_cast<LONG*>(&ghv.stopped_cpu_count));
+    }
+  }
+
+  if (!cpu->stop_virtualization)
+    dispatch_vm_exit(cpu, reason);
 
   if (!cpu->stop_virtualization) {
     // 处理共享队列，并根据是否有负载/待处理调整 VMX preemption timer
@@ -436,6 +446,7 @@ bool virtualize_cpu(vcpu* const cpu) {
   cpu->vm_exit_tsc_overhead      = 0;
   cpu->vm_exit_mperf_overhead    = 0;
   cpu->vm_exit_ref_tsc_overhead  = 0;
+  cpu->stop_notified             = false;
 
   DbgPrint("Launching VM on VCPU#%i...\n", KeGetCurrentProcessorIndex() + 1);
 
@@ -448,13 +459,6 @@ bool virtualize_cpu(vcpu* const cpu) {
   }
 
   DbgPrint("[hv] Launched VM on VCPU#%i.\n", KeGetCurrentProcessorIndex() + 1);
-
-  hypercall_input input;
-  input.code = hypercall_ping;
-  input.key  = hypercall_key;
-
-  if (vmx_vmcall(input) == hypervisor_signature)
-    DbgPrint("[hv] Successfully pinged the hypervisor.\n");
 
   cpu->vm_exit_tsc_overhead      = measure_vm_exit_tsc_overhead();
   cpu->vm_exit_mperf_overhead    = measure_vm_exit_mperf_overhead();

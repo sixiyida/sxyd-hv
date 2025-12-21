@@ -64,6 +64,9 @@ void hide_vm_exit_overhead(vcpu* const cpu) {
 
 // measure the overhead of a vm-exit (RDTSC)
 uint64_t measure_vm_exit_tsc_overhead() {
+#if defined(HV_NO_VMCALL)
+  return 0;
+#endif
   _disable();
 
   hypercall_input hv_input;
@@ -111,6 +114,9 @@ uint64_t measure_vm_exit_tsc_overhead() {
 
 // measure the overhead of a vm-exit (CPU_CLK_UNHALTED.REF_TSC)
 uint64_t measure_vm_exit_ref_tsc_overhead() {
+#if defined(HV_NO_VMCALL)
+  return 0;
+#endif
   _disable();
 
   hypercall_input hv_input;
@@ -181,6 +187,9 @@ uint64_t measure_vm_exit_ref_tsc_overhead() {
 
 // measure the overhead of a vm-exit (IA32_MPERF)
 uint64_t measure_vm_exit_mperf_overhead() {
+#if defined(HV_NO_VMCALL)
+  return 0;
+#endif
   _disable();
 
   hypercall_input hv_input;

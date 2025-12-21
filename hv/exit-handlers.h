@@ -20,7 +20,7 @@ void emulate_xsetbv(vcpu* cpu);
 
 void emulate_vmxon(vcpu* cpu);
 
-void emulate_vmcall(vcpu* cpu);
+void handle_vmcall(vcpu* cpu);
 
 void handle_vmx_preemption(vcpu* cpu);
 

@@ -2,7 +2,6 @@
 #include "guest-context.h"
 #include "exception-routines.h"
 #include "introspection.h"
-#include "hypercalls.h"
 #include "vcpu.h"
 #include "vmx.h"
 #include "logger.h"
@@ -210,41 +209,8 @@ void emulate_vmxon(vcpu*) {
   inject_hw_exception(general_protection, 0);
 }
 
-void emulate_vmcall(vcpu* const cpu) {
-  auto const code = cpu->ctx->rax & 0xFF;
-  auto const key  = cpu->ctx->rax >> 8;
-
-  // validate the hypercall key
-  if (key != hypercall_key) {
-    HV_LOG_VERBOSE("Invalid VMCALL key. RIP=%p.", vmx_vmread(VMCS_GUEST_RIP));
-    inject_hw_exception(invalid_opcode);
-    return;
-  }
-
-  // handle the hypercall
-  switch (code) {
-  case hypercall_ping:                 hc::ping(cpu);                 return;
-  case hypercall_test:                 hc::test(cpu);                 return;
-  case hypercall_unload:               hc::unload(cpu);               return;
-  case hypercall_read_phys_mem:        hc::read_phys_mem(cpu);        return;
-  case hypercall_write_phys_mem:       hc::write_phys_mem(cpu);       return;
-  case hypercall_read_virt_mem:        hc::read_virt_mem(cpu);        return;
-  case hypercall_write_virt_mem:       hc::write_virt_mem(cpu);       return;
-  case hypercall_query_process_cr3:    hc::query_process_cr3(cpu);    return;
-  case hypercall_install_ept_hook:     hc::install_ept_hook(cpu);     return;
-  case hypercall_remove_ept_hook:      hc::remove_ept_hook(cpu);      return;
-  case hypercall_flush_logs:           hc::flush_logs(cpu);           return;
-  case hypercall_get_physical_address: hc::get_physical_address(cpu); return;
-  case hypercall_hide_physical_page:   hc::hide_physical_page(cpu);   return;
-  case hypercall_unhide_physical_page: hc::unhide_physical_page(cpu); return;
-  case hypercall_get_hv_base:          hc::get_hv_base(cpu);          return;
-  case hypercall_install_mmr:          hc::install_mmr(cpu);          return;
-  case hypercall_remove_mmr:           hc::remove_mmr(cpu);           return;
-  case hypercall_remove_all_mmrs:      hc::remove_all_mmrs(cpu);      return;
-  }
-
-  HV_LOG_VERBOSE("Unhandled VMCALL. RIP=%p.", vmx_vmread(VMCS_GUEST_RIP));
-
+void handle_vmcall(vcpu*) {
+  // refuse all VMCALL attempts to mask the hypervisor presence
   inject_hw_exception(invalid_opcode);
 }
 
@@ -721,6 +687,9 @@ void handle_monitor_trap_flag(vcpu* const cpu) {
 
 void handle_ept_misconfiguration(vcpu*) {
   auto const phys = vmx_vmread(VMCS_GUEST_PHYSICAL_ADDRESS);
+#if defined(HV_NO_LOG)
+  UNREFERENCED_PARAMETER(phys);
+#endif
   HV_LOG_ERROR("Unhandled EPT Misconfiguration: %p", phys);
 }
 

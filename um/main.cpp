@@ -52,12 +52,6 @@ int main() {
     hs = hv::queue_handshake(req);
   } __except (EXCEPTION_EXECUTE_HANDLER) {
     printf("[um][err] handshake threw exception: 0x%08X\n", GetExceptionCode());
-    // 尝试读取 HV 日志
-    uint32_t count = 64;
-    hv::logger_msg msgs[64];
-    hv::flush_logs(count, msgs);
-    for (uint32_t i = 0; i < count; ++i)
-      printf("[HVLOG][%I64u][CPU=%u] %s\n", msgs[i].id, msgs[i].aux, msgs[i].data);
     VirtualUnlock(queue, queue_size);
     VirtualFree(queue, 0, MEM_RELEASE);
     printf("Press Enter to exit.\n");
@@ -67,12 +61,6 @@ int main() {
 
   printf("[um] queue handshake: signature=%llX status=%u pages=%u magic_echo=%llX\n",
     hs.signature, static_cast<uint32_t>(hs.status), hs.page_count, hs.echoed_magic);
-  fflush(stdout);
-
-  // 再做一次轻量 ping，确认 hypercall 路径仍可用
-  auto const ping_sig = hv::ping();
-  printf("[um] ping after handshake => 0x%llX (expect 0x%llX)\n",
-    ping_sig, hv::hypervisor_signature);
   fflush(stdout);
 
   if (hs.signature != hv::hypervisor_signature ||
@@ -113,30 +101,7 @@ int main() {
   qhdr->head = 1;
   _mm_mfence();
 
-  auto const hv_base = static_cast<uint8_t*>(hv::get_hv_base());
-  auto const hv_size = 0x64000;
-
-  // 4) 提交一个 read_phys 测试：读 HV 基址物理地址的一小段到共享缓冲区
-  uint64_t hv_phys = hv::get_physical_address(0, hv_base);
-  auto* read_buf = scratch; // 使用预留缓冲
-  ZeroMemory(read_buf, 0x80);
-
-  ZeroMemory(&qent[1], sizeof(hv::shared_queue_entry));
-  qent[1].cmd    = static_cast<uint32_t>(hv::shared_queue_cmd::read_phys);
-  qent[1].status = static_cast<uint32_t>(hv::shared_queue_entry_status::pending);
-  qent[1].gpa    = hv_phys;
-  qent[1].gva    = reinterpret_cast<uint64_t>(read_buf);
-  qent[1].size   = 0x40;
-
-  // 5) [RESTORE] write_phys 测试
-  ZeroMemory(&qent[2], sizeof(hv::shared_queue_entry));
-  qent[2].cmd    = static_cast<uint32_t>(hv::shared_queue_cmd::write_phys);
-  qent[2].status = static_cast<uint32_t>(hv::shared_queue_entry_status::pending);
-  qent[2].gpa    = hv_phys;
-  qent[2].gva    = reinterpret_cast<uint64_t>(read_buf);
-  qent[2].size   = 0x40;
-
-  // 6) 准备 virt 测试缓冲
+  // 4) 准备 virt 测试缓冲
   auto* virt_src = scratch + 0x100; // 0x80 bytes
   auto* virt_dst = scratch + 0x180; // 0x80 bytes
   for (size_t i = 0; i < 0x80; ++i)
@@ -144,82 +109,35 @@ int main() {
   ZeroMemory(virt_dst, 0x80);
 
   // write_virt: src=virt_src (current), dst=virt_dst (same cr3)
-  ZeroMemory(&qent[3], sizeof(hv::shared_queue_entry));
-  qent[3].cmd    = static_cast<uint32_t>(hv::shared_queue_cmd::write_virt);
-  qent[3].status = static_cast<uint32_t>(hv::shared_queue_entry_status::pending);
-  qent[3].cr3    = 0; // 0 表示当前 cr3
-  qent[3].gva    = reinterpret_cast<uint64_t>(virt_dst); // 目标 VA
-  qent[3].gpa    = reinterpret_cast<uint64_t>(virt_src); // 源 VA
-  qent[3].size   = 0x80;
+  ZeroMemory(&qent[1], sizeof(hv::shared_queue_entry));
+  qent[1].cmd    = static_cast<uint32_t>(hv::shared_queue_cmd::write_virt);
+  qent[1].status = static_cast<uint32_t>(hv::shared_queue_entry_status::pending);
+  qent[1].cr3    = 0; // 0 表示当前 cr3
+  qent[1].gva    = reinterpret_cast<uint64_t>(virt_dst); // 目标 VA
+  qent[1].gpa    = reinterpret_cast<uint64_t>(virt_src); // 源 VA
+  qent[1].size   = 0x80;
 
   // read_virt: src=virt_dst (target), dst=virt_dst2 (current)
   auto* virt_dst2 = scratch + 0x200; // 0x80 bytes
   ZeroMemory(virt_dst2, 0x80);
 
-  ZeroMemory(&qent[4], sizeof(hv::shared_queue_entry));
-  qent[4].cmd    = static_cast<uint32_t>(hv::shared_queue_cmd::read_virt);
-  qent[4].status = static_cast<uint32_t>(hv::shared_queue_entry_status::pending);
-  qent[4].cr3    = 0; // 当前 cr3
-  qent[4].gva    = reinterpret_cast<uint64_t>(virt_dst);  // 源 VA
-  qent[4].gpa    = reinterpret_cast<uint64_t>(virt_dst2); // 目标 VA
-  qent[4].size   = 0x80;
+  ZeroMemory(&qent[2], sizeof(hv::shared_queue_entry));
+  qent[2].cmd    = static_cast<uint32_t>(hv::shared_queue_cmd::read_virt);
+  qent[2].status = static_cast<uint32_t>(hv::shared_queue_entry_status::pending);
+  qent[2].cr3    = 0; // 当前 cr3
+  qent[2].gva    = reinterpret_cast<uint64_t>(virt_dst);  // 源 VA
+  qent[2].gpa    = reinterpret_cast<uint64_t>(virt_dst2); // 目标 VA
+  qent[2].size   = 0x80;
 
   _mm_mfence();
-  qhdr->head = 5; // 发布 5 个条目（nop + read_phys + write_phys + write_virt + read_virt）
+  qhdr->head = 3; // 发布 3 个条目（nop + write_virt + read_virt）
   _mm_mfence();
 
-  // hide the hypervisor
-  size_t hide_fail = 0;
-  hv::for_each_cpu([&](uint32_t) {
-    for (size_t i = 0; i < hv_size; i += 0x1000) {
-      auto const virt = hv_base + i;
-      auto const phys = hv::get_physical_address(0, virt);
-
-      if (!phys) {
-        printf("[um][warn] failed to get physical address for 0x%p.\n", virt);
-        continue;
-      }
-
-      if (!hv::hide_physical_page(phys >> 12)) {
-        ++hide_fail;
-        printf("[um][warn] failed to hide page: 0x%p (pfn=0x%llX).\n", virt, phys >> 12);
-      }
-    }
-  });
-  printf("[um] hide pages done. fail count=%zu\n", hide_fail);
-  fflush(stdout);
-
-  printf("Pinged the hypervisor! Flushing logs...\n");
-  fflush(stdout);
-
-  FILE* file = nullptr;
-  fopen_s(&file, "hvlog.txt", "a");
-  if (!file) {
-    printf("[um][err] failed to open hvlog.txt for append.\n");
-  }
-
+  // 轮询检查 tail 是否前进，验证队列消费
   while (!GetAsyncKeyState(VK_RETURN)) {
-    // flush the logs
-    uint32_t count = 512;
-    hv::logger_msg msgs[512];
-    hv::flush_logs(count, msgs);
-
-    // print the logs
-    for (uint32_t i = 0; i < count; ++i) {
-      printf("[%I64u][CPU=%u] %s\n", msgs[i].id, msgs[i].aux, msgs[i].data);
-      if (file)
-        fprintf(file, "[%I64u][CPU=%u] %s\n", msgs[i].id, msgs[i].aux, msgs[i].data);
-    }
-
-    if (file)
-      fflush(file);
-
-    // 轮询检查 tail 是否前进，验证 NOP 已被消费
     static bool entry0_reported = false;
     static bool entry1_reported = false;
     static bool entry2_reported = false;
-    static bool entry3_reported = false;
-    static bool entry4_reported = false;
     auto const tail = qhdr->tail;
     if (!entry0_reported &&
         tail > 0 &&
@@ -230,60 +148,26 @@ int main() {
     if (!entry1_reported &&
         tail > 1 &&
         qent[1].status == static_cast<uint32_t>(hv::shared_queue_entry_status::done)) {
-      printf("[um] queue entry 1 done (read_phys) tail=%u size=%u\n", tail, qent[1].size);
-      printf("[um] read_phys buffer (first 32 bytes):\n  ");
-      for (size_t i = 0; i < 32; ++i) {
-        printf("%02X ", read_buf[i]);
-      }
-      printf("\n");
+      printf("[um] queue entry 1 done (write_virt) tail=%u size=%u\n", tail, qent[1].size);
       entry1_reported = true;
     }
     if (!entry2_reported &&
         tail > 2 &&
         qent[2].status == static_cast<uint32_t>(hv::shared_queue_entry_status::done)) {
-      printf("[um] queue entry 2 done (write_phys) tail=%u size=%u\n", tail, qent[2].size);
-      entry2_reported = true;
-    }
-    if (!entry3_reported &&
-        tail > 3 &&
-        qent[3].status == static_cast<uint32_t>(hv::shared_queue_entry_status::done)) {
-      printf("[um] queue entry 3 done (write_virt) tail=%u size=%u\n", tail, qent[3].size);
-      entry3_reported = true;
-    }
-    if (!entry4_reported &&
-        tail > 4 &&
-        qent[4].status == static_cast<uint32_t>(hv::shared_queue_entry_status::done)) {
-      printf("[um] queue entry 4 done (read_virt) tail=%u size=%u\n", tail, qent[4].size);
+      printf("[um] queue entry 2 done (read_virt) tail=%u size=%u\n", tail, qent[2].size);
       printf("[um] read_virt buffer (first 32 bytes):\n  ");
       for (size_t i = 0; i < 32; ++i) {
         printf("%02X ", virt_dst2[i]);
       }
       printf("\n");
-      entry4_reported = true;
+      entry2_reported = true;
     }
+
+    if (entry0_reported && entry1_reported && entry2_reported)
+      break;
 
     Sleep(200);
   }
-
-  if (file)
-    fclose(file);
-
-  printf("[um] unhiding pages...\n");
-  size_t unhide_fail = 0;
-  hv::for_each_cpu([&](uint32_t) {
-    hv::remove_all_mmrs();
-
-    for (size_t i = 0; i < hv_size; i += 0x1000) {
-      auto const virt = hv_base + i;
-      auto const phys = hv::get_physical_address(0, virt);
-
-      if (!phys)
-        continue;
-
-      hv::unhide_physical_page(phys >> 12);
-    }
-  });
-  printf("[um] unhide pages done. fail count=%zu\n", unhide_fail);
 
   // 6) 在退出前显式注销共享队列，避免退出后 CR3/页复用导致 HV 继续写旧队列
   hv::queue_handshake_request dereg{};

@@ -17,6 +17,24 @@ NTKERNELAPI void PsGetProcessImageFileName();
 
 }
 
+// generate a per-load pool tag to avoid static signatures
+static uint32_t generate_pool_tag() {
+  auto const counter = KeQueryPerformanceCounter(nullptr);
+  uint32_t seed = static_cast<uint32_t>(counter.LowPart ^ counter.HighPart ^
+    reinterpret_cast<uintptr_t>(&ghv));
+
+  // simple LCG to avoid relying on RtlRandomEx declaration visibility
+  seed = seed ? seed : 0x13579BDFu;
+  seed = seed * 1664525u + 1013904223u;
+
+  auto tag = seed;
+
+  if (tag == 0)
+    tag = 'enoN'; // fall back to a common kernel tag shape
+
+  return tag;
+}
+
 // dynamically find the offsets for various kernel structures
 static bool find_offsets() {
   // TODO: maybe dont hardcode this...
@@ -102,6 +120,8 @@ static bool create() {
 
   logger_init();
 
+  ghv.pool_tag = generate_pool_tag();
+
   ghv.vcpu_count = KeQueryActiveProcessorCount(nullptr);
 
   // size of the vcpu array
@@ -109,7 +129,7 @@ static bool create() {
 
   // allocate an array of vcpus
   ghv.vcpus = static_cast<vcpu*>(ExAllocatePoolWithTag(
-    NonPagedPoolNx, arr_size, 'fr0g'));
+    NonPagedPoolNx, arr_size, ghv.pool_tag));
 
   if (!ghv.vcpus) {
     DbgPrint("[hv] Failed to allocate VCPUs.\n");
@@ -166,33 +186,41 @@ void stop() {
   // that KeSetSystemAffinityThreadEx takes effect immediately
   NT_ASSERT(KeGetCurrentIrql() <= APC_LEVEL);
 
-  // virtualize every cpu
-  for (unsigned long i = 0; i < ghv.vcpu_count; ++i) {
-    // restrict execution to the specified cpu
-    auto const orig_affinity = KeSetSystemAffinityThreadEx(1ull << i);
+  if (!ghv.vcpus || ghv.vcpu_count == 0)
+    return;
 
-    // its possible that someone tried to call stop() when the hypervisor
-    // wasn't even running, so we're wrapping this in a nice try-except
-    // block. nice job.
-    __try {
-      hv::hypercall_input input;
-      input.code = hv::hypercall_unload;
-      input.key  = hv::hypercall_key;
-      vmx_vmcall(input);
-    }
-    __except (1) {}
+  // reset per-vcpu notification flags
+  for (unsigned long i = 0; i < ghv.vcpu_count; ++i)
+    ghv.vcpus[i].stop_notified = false;
 
-    KeRevertToUserAffinityThreadEx(orig_affinity);
+  InterlockedExchange(const_cast<LONG*>(&ghv.stopped_cpu_count), 0);
+  InterlockedExchange(const_cast<LONG*>(&ghv.stop_requested), 1);
+
+  // wait for all vcpus to exit VMX (triggered on next VM-exit)
+  LARGE_INTEGER interval;
+  interval.QuadPart = -10 * 1000 * 10; // 10ms
+
+  uint32_t spins = 0;
+  while (static_cast<unsigned long>(ghv.stopped_cpu_count) < ghv.vcpu_count && spins++ < 1000) {
+    KeDelayExecutionThread(KernelMode, FALSE, &interval);
+  }
+
+  if (static_cast<unsigned long>(ghv.stopped_cpu_count) < ghv.vcpu_count) {
+    DbgPrint("[hv] stop(): timeout waiting for vcpus to devirtualize (%ld/%lu).\n",
+      ghv.stopped_cpu_count, ghv.vcpu_count);
   }
 
   // 清空共享队列注册，避免残留 CR3/地址在停止后被误用
   clear_all_shared_queues();
 
   if (ghv.vcpus) {
-    ExFreePoolWithTag(ghv.vcpus, 'fr0g');
+    auto const tag = ghv.pool_tag ? ghv.pool_tag : static_cast<uint32_t>('enoN');
+    ExFreePoolWithTag(ghv.vcpus, tag);
     ghv.vcpus = nullptr;
     ghv.vcpu_count = 0;
   }
+
+  InterlockedExchange(const_cast<LONG*>(&ghv.stop_requested), 0);
 }
 
 } // namespace hv

@@ -35,14 +35,6 @@ EXTERN_C void process_notify_ex(
 
 } // namespace
 
-// simple hypercall wrappers
-static uint64_t ping() {
-  hv::hypercall_input input;
-  input.code = hv::hypercall_ping;
-  input.key  = hv::hypercall_key;
-  return hv::vmx_vmcall(input);
-}
-
 void driver_unload(PDRIVER_OBJECT) {
   // 先停止虚拟化（避免 stop 过程中回调带来额外并发），再注销回调
   hv::stop();
@@ -69,11 +61,6 @@ NTSTATUS driver_entry(PDRIVER_OBJECT const driver, PUNICODE_STRING) {
   if (!NT_SUCCESS(st)) {
     DbgPrint("[hv] Failed to register process notify callback: 0x%08X.\n", st);
   }
-
-  if (ping() == hv::hypervisor_signature)
-    DbgPrint("[client] Hypervisor signature matches.\n");
-  else
-    DbgPrint("[client] Failed to ping hypervisor!\n");
 
   return STATUS_SUCCESS;
 }
