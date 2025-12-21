@@ -14,7 +14,8 @@ void emulate_cpuid(vcpu* const cpu) {
   auto const ctx = cpu->ctx;
 
   if (ctx->eax == shared_queue_cpuid_leaf &&
-      ctx->ecx == shared_queue_cpuid_subleaf_handshake) {
+      ctx->ecx == shared_queue_magic0 &&
+      ctx->rsi == shared_queue_magic1) {
     cr3 guest_cr3;
     guest_cr3.flags = vmx_vmread(VMCS_GUEST_CR3);
 

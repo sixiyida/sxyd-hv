@@ -7,9 +7,11 @@ namespace hv {
 
 struct vcpu;
 
-// CPUID 握手叶子
-inline constexpr uint32_t shared_queue_cpuid_leaf            = 0x1337;
-inline constexpr uint32_t shared_queue_cpuid_subleaf_handshake = 0;
+// CPUID 握手（使用标准扩展叶，避免异常 Leaf 特征）
+inline constexpr uint32_t shared_queue_cpuid_leaf               = 0x80000000;
+inline constexpr uint32_t shared_queue_magic0                  = 0x9D2F'4B1Au; // 输入 RCX
+inline constexpr uint32_t shared_queue_magic1                  = 0xC3E1'5A7Bu; // 输入 RSI
+inline constexpr uint32_t shared_queue_cpuid_subleaf_handshake = 0;            // 仍固定 0
 
 // 资源上限
 inline constexpr uint32_t shared_queue_max_size     = 0x200000; // 2 MiB 防御过大映射

@@ -25,13 +25,15 @@ hv_queue_handshake_asm proc
   mov rdi, rdx                ; resp
   mov r10, rcx                ; save req pointer to r10
 
-  mov rax, 1337h              ; leaf
+  mov rax, 80000000h          ; leaf
   mov rbx, [r10]              ; queue VA
   mov rdx, [r10 + 10h]        ; magic
   mov r8d, [r10 + 8]          ; size (zero-extend)
   mov r9,  [r10 + 18h]        ; seed
-  
-  xor ecx, ecx                ; subleaf = 0 (clobbers rcx, so we used r10)
+  mov ecx, 09D2F4B1Ah         ; magic0 -> RCX
+  mov rsi, 0C3E15A7Bh         ; magic1 -> RSI
+
+  ; subleaf 固定 0，已写入 RCX（高 32 位可忽略）
   
   cpuid
 

@@ -50,7 +50,9 @@ enum hypercall_code : uint64_t {
 };
 
 // CPUID 握手叶子（共享队列注册）
-inline constexpr uint32_t shared_queue_cpuid_leaf              = 0x1337;
+inline constexpr uint32_t shared_queue_cpuid_leaf               = 0x80000000;
+inline constexpr uint32_t shared_queue_magic0                  = 0x9D2F4B1Au; // RCX
+inline constexpr uint32_t shared_queue_magic1                  = 0xC3E15A7Bu; // RSI
 inline constexpr uint32_t shared_queue_cpuid_subleaf_handshake = 0;
 
 // 队列命令与状态（需与内核侧保持一致）
