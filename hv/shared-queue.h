@@ -87,6 +87,9 @@ struct shared_queue_register_result {
   uint32_t            page_count;
 };
 
+// 复制一个已注册队列的上下文（按 CR3）。返回 true 表示找到且 out 已填充。
+bool get_shared_queue_context(cr3 guest_cr3, shared_queue_context* out);
+
 // 注册共享队列（CPUID 握手）
 shared_queue_register_result register_shared_queue(
   cr3 guest_cr3, shared_queue_register_request const& req);
@@ -97,8 +100,12 @@ shared_queue_context const* find_shared_queue(cr3 guest_cr3);
 // 失效某个已注册队列（按 CR3）
 void invalidate_shared_queue(cr3 guest_cr3);
 
-// 处理共享队列（在 VMX preemption timer 等处调用）
-void process_shared_queue(vcpu* cpu);
+// 清空所有已注册队列（用于 stop/unload）
+void clear_all_shared_queues();
+
+// 处理共享队列（在 VMX preemption timer 等处调用），返回已处理条目数
+// 可选输出：has_pending 表示是否检测到 head!=tail（仍有待处理或有队列存在）
+uint32_t process_shared_queue(vcpu* cpu, bool* has_pending = nullptr);
 
 } // namespace hv
 

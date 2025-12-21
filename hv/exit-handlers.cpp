@@ -248,10 +248,9 @@ void emulate_vmcall(vcpu* const cpu) {
   inject_hw_exception(invalid_opcode);
 }
 
-void handle_vmx_preemption(vcpu*) {
-  // 轮询共享队列（基于 VMX preemption timer）
-  // 注意：处理逻辑批量/有限次，避免占用过久
-  process_shared_queue(nullptr);
+void handle_vmx_preemption(vcpu* const cpu) {
+  // 预emption timer 触发时处理队列（定时轮询场景）
+  process_shared_queue(cpu);
 }
 
 void emulate_mov_to_cr0(vcpu* const cpu, uint64_t const gpr) {

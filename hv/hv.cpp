@@ -2,6 +2,7 @@
 #include "vcpu.h"
 #include "mm.h"
 #include "arch.h"
+#include "shared-queue.h"
 
 namespace hv {
 
@@ -184,7 +185,14 @@ void stop() {
     KeRevertToUserAffinityThreadEx(orig_affinity);
   }
 
-  ExFreePoolWithTag(ghv.vcpus, 'fr0g');
+  // 清空共享队列注册，避免残留 CR3/地址在停止后被误用
+  clear_all_shared_queues();
+
+  if (ghv.vcpus) {
+    ExFreePoolWithTag(ghv.vcpus, 'fr0g');
+    ghv.vcpus = nullptr;
+    ghv.vcpu_count = 0;
+  }
 }
 
 } // namespace hv

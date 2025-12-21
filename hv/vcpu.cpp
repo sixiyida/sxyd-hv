@@ -10,6 +10,7 @@
 #include "exception-routines.h"
 #include "introspection.h"
 #include "shared-queue.h"
+#include <ia32.hpp>
 
 // first byte at the start of the image
 extern "C" uint8_t __ImageBase;
@@ -240,18 +241,32 @@ bool handle_vm_exit(guest_context* const ctx) {
 
   dispatch_vm_exit(cpu, reason);
 
-  // 处理共享队列（批量有限，开销低），确保至少每次 vm-exit 都有机会消费
-  process_shared_queue(cpu);
+  if (!cpu->stop_virtualization) {
+    // 处理共享队列，并根据是否有负载/待处理调整 VMX preemption timer
+    bool has_pending = false;
+    auto const processed = process_shared_queue(cpu, &has_pending);
 
-  vmentry_interrupt_information interrupt_info;
-  interrupt_info.flags = static_cast<uint32_t>(
-    vmx_vmread(VMCS_CTRL_VMENTRY_INTERRUPTION_INFORMATION_FIELD));
+    // 简单自适应：有负载/待处理 -> 短周期；空闲 -> 长周期
+    uint32_t short_ticks = 10000u >> cpu->cached.vmx_misc.preemption_timer_tsc_relationship;
+    if (short_ticks < 2)
+      short_ticks = 2;
+    uint32_t long_ticks = short_ticks * 1024;
+    if (long_ticks < short_ticks) // 溢出保护
+      long_ticks = 0xFFFFFFFFu;
 
-  if (interrupt_info.valid) {
-    char name[16] = {};
-    current_guest_image_file_name(name);
-    HV_LOG_INJECT_INT("Injecting interrupt into guest (%s). BasicExitReason=%i, Vector=%i, Error=%i.",
-      name, reason.basic_exit_reason, interrupt_info.vector, vmx_vmread(VMCS_CTRL_VMENTRY_EXCEPTION_ERROR_CODE));
+    uint32_t next = (processed > 0 || has_pending) ? short_ticks : long_ticks;
+    vmx_vmwrite(VMCS_GUEST_VMX_PREEMPTION_TIMER_VALUE, next);
+
+    vmentry_interrupt_information interrupt_info;
+    interrupt_info.flags = static_cast<uint32_t>(
+      vmx_vmread(VMCS_CTRL_VMENTRY_INTERRUPTION_INFORMATION_FIELD));
+
+    if (interrupt_info.valid) {
+      char name[16] = {};
+      current_guest_image_file_name(name);
+      HV_LOG_INJECT_INT("Injecting interrupt into guest (%s). BasicExitReason=%i, Vector=%i, Error=%i.",
+        name, reason.basic_exit_reason, interrupt_info.vector, vmx_vmread(VMCS_CTRL_VMENTRY_EXCEPTION_ERROR_CODE));
+    }
   }
 
   // restore guest state. the assembly code is responsible for restoring
@@ -284,12 +299,6 @@ bool handle_vm_exit(guest_context* const ctx) {
     gdtr.limit = static_cast<uint16_t>(vmx_vmread(VMCS_GUEST_GDTR_LIMIT));
     _lgdt(&gdtr);
 
-    // IDT
-    segment_descriptor_register_64 idtr;
-    idtr.base_address = vmx_vmread(VMCS_GUEST_IDTR_BASE);
-    idtr.limit = static_cast<uint16_t>(vmx_vmread(VMCS_GUEST_IDTR_LIMIT));
-    __lidt(&idtr);
-
     segment_selector guest_tr;
     guest_tr.flags = static_cast<uint16_t>(vmx_vmread(VMCS_GUEST_TR_SELECTOR));
 
@@ -308,6 +317,12 @@ bool handle_vm_exit(guest_context* const ctx) {
     // FS and GS base address
     _writefsbase_u64(vmx_vmread(VMCS_GUEST_FS_BASE));
     _writegsbase_u64(vmx_vmread(VMCS_GUEST_GS_BASE));
+
+    // IDT
+    segment_descriptor_register_64 idtr;
+    idtr.base_address = vmx_vmread(VMCS_GUEST_IDTR_BASE);
+    idtr.limit = static_cast<uint16_t>(vmx_vmread(VMCS_GUEST_IDTR_LIMIT));
+    __lidt(&idtr);
 
     return true;
   }

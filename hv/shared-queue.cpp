@@ -5,6 +5,7 @@
 #include "vmx.h"
 #include "page-tables.h"
 #include "exception-routines.h"
+#include "hv.h"
 
 namespace hv {
 
@@ -18,6 +19,16 @@ shared_queue_context g_queue_entries[shared_queue_max_entries] = {};
 shared_queue_register_result register_shared_queue(
   cr3 const guest_cr3, shared_queue_register_request const& req) {
   shared_queue_register_result result{};
+
+  // 允许“注销/失效”操作：queue_size==0 视为对当前 CR3 的注销请求。
+  // 这能让用户态在退出前显式解绑，避免 CR3/页复用导致的内存破坏。
+  if (req.queue_size == 0) {
+    invalidate_shared_queue(guest_cr3);
+    result.status = shared_queue_status::success;
+    result.page_count = 0;
+    HV_LOG_INFO("[sq] deregister request: cr3=%p", guest_cr3.flags);
+    return result;
+  }
 
   if (!req.queue_size || req.queue_size > shared_queue_max_size) {
     result.status = shared_queue_status::invalid_size;
@@ -94,6 +105,20 @@ shared_queue_register_result register_shared_queue(
   return result;
 }
 
+bool get_shared_queue_context(cr3 const guest_cr3, shared_queue_context* const out) {
+  if (!out)
+    return false;
+
+  scoped_spin_lock lock(g_queue_lock);
+  for (auto const& entry : g_queue_entries) {
+    if (entry.valid && entry.guest_cr3.flags == guest_cr3.flags) {
+      *out = entry; // 拷贝快照，避免锁外使用时被并发失效/覆盖
+      return true;
+    }
+  }
+  return false;
+}
+
 shared_queue_context const* find_shared_queue(cr3 const guest_cr3) {
   scoped_spin_lock lock(g_queue_lock);
 
@@ -116,40 +141,61 @@ void invalidate_shared_queue(cr3 const guest_cr3) {
   }
 }
 
-void process_shared_queue(vcpu* const /*cpu*/) {
+void clear_all_shared_queues() {
+  scoped_spin_lock lock(g_queue_lock);
+  for (auto& entry : g_queue_entries)
+    entry.valid = false;
+  HV_LOG_INFO("[sq] cleared all queues.");
+}
+
+uint32_t process_shared_queue(vcpu* const /*cpu*/, bool* const has_pending) {
   cr3 guest_cr3;
   guest_cr3.flags = vmx_vmread(VMCS_GUEST_CR3);
 
-  auto const ctx = find_shared_queue(guest_cr3);
-  if (!ctx)
-    return;
+  shared_queue_context ctx{};
+  if (!get_shared_queue_context(guest_cr3, &ctx))
+    return 0;
+
+  // 轻量一致性校验：如果队列所在第一页 PFN 与注册时不一致，说明映射/物理页已变化
+  //（常见于用户态释放/重映射、CR3/页复用）。此时必须立即失效避免写坏随机内存。
+  auto const base_page_va = ctx.queue_gva & ~0xFFFull;
+  auto const base_gpa = gva2gpa(guest_cr3, reinterpret_cast<void*>(base_page_va), nullptr);
+  if (!base_gpa || (base_gpa >> 12) != ctx.page_pfns[0]) {
+    HV_LOG_ERROR("[sq] queue page changed: cr3=%p gva=%p old_pfn=%p new_gpa=%p",
+      guest_cr3.flags, ctx.queue_gva, ctx.page_pfns[0], base_gpa);
+    invalidate_shared_queue(guest_cr3);
+    return 0;
+  }
 
   size_t header_remaining = 0;
   auto* header = reinterpret_cast<shared_queue_header*>(
-    gva2hva(guest_cr3, reinterpret_cast<void*>(ctx->queue_gva), &header_remaining));
+    gva2hva(guest_cr3, reinterpret_cast<void*>(ctx.queue_gva), &header_remaining));
 
   if (!header || header_remaining < sizeof(shared_queue_header)) {
-    HV_LOG_ERROR("[sq] header translation failed: gva=%p cr3=%p", ctx->queue_gva, guest_cr3.flags);
+    HV_LOG_ERROR("[sq] header translation failed: gva=%p cr3=%p", ctx.queue_gva, guest_cr3.flags);
     invalidate_shared_queue(guest_cr3);
-    return;
+    return 0;
   }
 
-  auto const capacity = (ctx->queue_size > sizeof(shared_queue_header))
-    ? static_cast<uint32_t>((ctx->queue_size - sizeof(shared_queue_header)) / sizeof(shared_queue_entry))
+  auto const capacity = (ctx.queue_size > sizeof(shared_queue_header))
+    ? static_cast<uint32_t>((ctx.queue_size - sizeof(shared_queue_header)) / sizeof(shared_queue_entry))
     : 0;
 
   if (capacity == 0)
-    return;
+    return 0;
 
   auto head = header->head;
   auto tail = header->tail;
+
+  if (has_pending)
+    *has_pending = (head != tail);
 
   uint32_t processed = 0;
   constexpr uint32_t max_batch = 4;
 
   while (tail != head && processed < max_batch) {
     auto const idx = tail % capacity;
-    auto const entry_gva = ctx->queue_gva + sizeof(shared_queue_header)
+    auto const entry_gva = ctx.queue_gva + sizeof(shared_queue_header)
       + static_cast<uint64_t>(idx) * sizeof(shared_queue_entry);
 
     size_t entry_remaining = 0;
@@ -227,6 +273,84 @@ void process_shared_queue(vcpu* const /*cpu*/) {
       entry->status = static_cast<uint32_t>(shared_queue_entry_status::done);
     } break;
 
+    case shared_queue_cmd::read_virt: {
+      cr3 target_cr3;
+      target_cr3.flags = entry->cr3 ? entry->cr3 : guest_cr3.flags;
+
+      auto const* src = reinterpret_cast<uint8_t const*>(entry->gva); // 源 VA（目标 CR3）
+      auto* const dst = reinterpret_cast<uint8_t*>(entry->gpa);       // 目的 VA（当前进程）
+      auto const size = static_cast<size_t>(entry->size);
+
+      size_t copied = 0;
+      while (copied < size) {
+        size_t dst_remaining = 0, src_remaining = 0;
+        auto* curr_dst = reinterpret_cast<uint8_t*>(
+          gva2hva(guest_cr3, dst + copied, &dst_remaining));
+        auto const* curr_src = reinterpret_cast<uint8_t const*>(
+          gva2hva(target_cr3, const_cast<uint8_t*>(src + copied), &src_remaining));
+
+        if (!curr_dst || !curr_src) {
+          entry->status = static_cast<uint32_t>(shared_queue_entry_status::err_translate);
+          goto done_entry;
+        }
+
+        size_t curr_size = (dst_remaining < (size - copied))
+          ? dst_remaining
+          : (size - copied);
+        if (curr_size > src_remaining)
+          curr_size = src_remaining;
+
+        host_exception_info e;
+        memcpy_safe(e, curr_dst, curr_src, curr_size);
+        if (e.exception_occurred) {
+          entry->status = static_cast<uint32_t>(shared_queue_entry_status::err_translate);
+          goto done_entry;
+        }
+        copied += curr_size;
+      }
+      entry->aux    = size;
+      entry->status = static_cast<uint32_t>(shared_queue_entry_status::done);
+    } break;
+
+    case shared_queue_cmd::write_virt: {
+      cr3 target_cr3;
+      target_cr3.flags = entry->cr3 ? entry->cr3 : guest_cr3.flags;
+
+      auto const* src = reinterpret_cast<uint8_t const*>(entry->gpa); // 源 VA（当前进程）
+      auto* const dst = reinterpret_cast<uint8_t*>(entry->gva);       // 目的 VA（目标 CR3）
+      auto const size = static_cast<size_t>(entry->size);
+
+      size_t copied = 0;
+      while (copied < size) {
+        size_t dst_remaining = 0, src_remaining = 0;
+        auto* curr_dst = reinterpret_cast<uint8_t*>(
+          gva2hva(target_cr3, dst + copied, &dst_remaining));
+        auto const* curr_src = reinterpret_cast<uint8_t const*>(
+          gva2hva(guest_cr3, const_cast<uint8_t*>(src + copied), &src_remaining));
+
+        if (!curr_dst || !curr_src) {
+          entry->status = static_cast<uint32_t>(shared_queue_entry_status::err_translate);
+          goto done_entry;
+        }
+
+        size_t curr_size = (dst_remaining < (size - copied))
+          ? dst_remaining
+          : (size - copied);
+        if (curr_size > src_remaining)
+          curr_size = src_remaining;
+
+        host_exception_info e;
+        memcpy_safe(e, curr_dst, curr_src, curr_size);
+        if (e.exception_occurred) {
+          entry->status = static_cast<uint32_t>(shared_queue_entry_status::err_translate);
+          goto done_entry;
+        }
+        copied += curr_size;
+      }
+      entry->aux    = size;
+      entry->status = static_cast<uint32_t>(shared_queue_entry_status::done);
+    } break;
+
     default:
       entry->status = static_cast<uint32_t>(shared_queue_entry_status::err_unimplemented);
       break;
@@ -247,6 +371,7 @@ done_entry:
   }
 
   header->tail = tail;
+  return processed;
 }
 
 } // namespace hv
