@@ -6,6 +6,7 @@
 #include "page-tables.h"
 #include "exception-routines.h"
 #include "hv.h"
+#include "ept.h"
 
 namespace hv {
 
@@ -148,7 +149,9 @@ void clear_all_shared_queues() {
   HV_LOG_INFO("[sq] cleared all queues.");
 }
 
-uint32_t process_shared_queue(vcpu* const /*cpu*/, bool* const has_pending) {
+uint32_t process_shared_queue(vcpu* const cpu, bool* const has_pending) {
+  if (!cpu)
+    return 0;
   cr3 guest_cr3;
   guest_cr3.flags = vmx_vmread(VMCS_GUEST_CR3);
 
@@ -349,6 +352,35 @@ uint32_t process_shared_queue(vcpu* const /*cpu*/, bool* const has_pending) {
       }
       entry->aux    = size;
       entry->status = static_cast<uint32_t>(shared_queue_entry_status::done);
+    } break;
+
+    case shared_queue_cmd::query_ept_map: {
+      // Input:
+      //   entry->cr3 : target CR3 (0 => current guest cr3)
+      //   entry->gva : guest virtual address to query
+      // Output:
+      //   entry->gpa      = original PFN (gpa >> 12)
+      //   entry->aux      = mapped PFN in EPT
+      //   entry->reserved = dummy PFN (for comparison)
+      cr3 target_cr3;
+      target_cr3.flags = entry->cr3 ? entry->cr3 : guest_cr3.flags;
+
+      auto const gpa = gva2gpa(target_cr3, reinterpret_cast<void*>(entry->gva), nullptr);
+      if (!gpa) {
+        entry->status = static_cast<uint32_t>(shared_queue_entry_status::err_translate);
+        goto done_entry;
+      }
+
+      auto const pte = get_ept_pte(cpu->ept, gpa, false);
+      if (!pte) {
+        entry->status = static_cast<uint32_t>(shared_queue_entry_status::err_translate);
+        goto done_entry;
+      }
+
+      entry->gpa      = (gpa >> 12);
+      entry->aux      = pte->page_frame_number;
+      entry->reserved = cpu->ept.dummy_page_pfn;
+      entry->status   = static_cast<uint32_t>(shared_queue_entry_status::done);
     } break;
 
     default:

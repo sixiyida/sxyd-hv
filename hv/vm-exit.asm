@@ -92,23 +92,23 @@ extern ?handle_vm_exit@hv@@YA_NQEAUguest_context@1@@Z : proc
   mov rax, dr6
   mov guest_context.$dr6[rsp], rax
 
-  ; SSE registers
-  movaps guest_context.$xmm0[rsp], xmm0
-  movaps guest_context.$xmm1[rsp], xmm1
-  movaps guest_context.$xmm2[rsp], xmm2
-  movaps guest_context.$xmm3[rsp], xmm3
-  movaps guest_context.$xmm4[rsp], xmm4
-  movaps guest_context.$xmm5[rsp], xmm5
-  movaps guest_context.$xmm6[rsp], xmm6
-  movaps guest_context.$xmm7[rsp], xmm7
-  movaps guest_context.$xmm8[rsp], xmm8
-  movaps guest_context.$xmm9[rsp], xmm9
-  movaps guest_context.$xmm10[rsp], xmm10
-  movaps guest_context.$xmm11[rsp], xmm11
-  movaps guest_context.$xmm12[rsp], xmm12
-  movaps guest_context.$xmm13[rsp], xmm13
-  movaps guest_context.$xmm14[rsp], xmm14
-  movaps guest_context.$xmm15[rsp], xmm15
+  ; SSE registers (unaligned-safe)
+  movups guest_context.$xmm0[rsp], xmm0
+  movups guest_context.$xmm1[rsp], xmm1
+  movups guest_context.$xmm2[rsp], xmm2
+  movups guest_context.$xmm3[rsp], xmm3
+  movups guest_context.$xmm4[rsp], xmm4
+  movups guest_context.$xmm5[rsp], xmm5
+  movups guest_context.$xmm6[rsp], xmm6
+  movups guest_context.$xmm7[rsp], xmm7
+  movups guest_context.$xmm8[rsp], xmm8
+  movups guest_context.$xmm9[rsp], xmm9
+  movups guest_context.$xmm10[rsp], xmm10
+  movups guest_context.$xmm11[rsp], xmm11
+  movups guest_context.$xmm12[rsp], xmm12
+  movups guest_context.$xmm13[rsp], xmm13
+  movups guest_context.$xmm14[rsp], xmm14
+  movups guest_context.$xmm15[rsp], xmm15
 
   ; first argument is the guest context
   mov rcx, rsp
@@ -118,23 +118,23 @@ extern ?handle_vm_exit@hv@@YA_NQEAUguest_context@1@@Z : proc
   call ?handle_vm_exit@hv@@YA_NQEAUguest_context@1@@Z
   add rsp, 28h
 
-  ; SSE registers
-  movaps xmm0, guest_context.$xmm0[rsp]
-  movaps xmm1, guest_context.$xmm1[rsp]
-  movaps xmm2, guest_context.$xmm2[rsp]
-  movaps xmm3, guest_context.$xmm3[rsp]
-  movaps xmm4, guest_context.$xmm4[rsp]
-  movaps xmm5, guest_context.$xmm5[rsp]
-  movaps xmm6, guest_context.$xmm6[rsp]
-  movaps xmm7, guest_context.$xmm7[rsp]
-  movaps xmm8, guest_context.$xmm8[rsp]
-  movaps xmm9, guest_context.$xmm9[rsp]
-  movaps xmm10, guest_context.$xmm10[rsp]
-  movaps xmm11, guest_context.$xmm11[rsp]
-  movaps xmm12, guest_context.$xmm12[rsp]
-  movaps xmm13, guest_context.$xmm13[rsp]
-  movaps xmm14, guest_context.$xmm14[rsp]
-  movaps xmm15, guest_context.$xmm15[rsp]
+  ; SSE registers (unaligned-safe)
+  movups xmm0, guest_context.$xmm0[rsp]
+  movups xmm1, guest_context.$xmm1[rsp]
+  movups xmm2, guest_context.$xmm2[rsp]
+  movups xmm3, guest_context.$xmm3[rsp]
+  movups xmm4, guest_context.$xmm4[rsp]
+  movups xmm5, guest_context.$xmm5[rsp]
+  movups xmm6, guest_context.$xmm6[rsp]
+  movups xmm7, guest_context.$xmm7[rsp]
+  movups xmm8, guest_context.$xmm8[rsp]
+  movups xmm9, guest_context.$xmm9[rsp]
+  movups xmm10, guest_context.$xmm10[rsp]
+  movups xmm11, guest_context.$xmm11[rsp]
+  movups xmm12, guest_context.$xmm12[rsp]
+  movups xmm13, guest_context.$xmm13[rsp]
+  movups xmm14, guest_context.$xmm14[rsp]
+  movups xmm15, guest_context.$xmm15[rsp]
 
   ; handle_vm_exit returns true if we should stop virtualization
   mov r15, rax

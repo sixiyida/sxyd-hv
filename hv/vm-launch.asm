@@ -2,14 +2,25 @@
 
 ; bool __vm_launch();
 ?vm_launch@hv@@YA_NXZ proc
-  ; set VMCS_GUEST_RSP to the current value of RSP
-  mov rax, 681Ch
-  vmwrite rax, rsp
+  extern hv_vmx_vmwrite_raw : proc
 
-  ; set VMCS_GUEST_RIP to the address of <successful_launch>
-  mov rax, 681Eh
-  mov rdx, successful_launch
-  vmwrite rax, rdx
+  ; Save the entry RSP (contains the return address back to the C++ caller).
+  mov r8, rsp
+
+  ; Windows x64: reserve shadow space + align for calls.
+  sub rsp, 28h
+
+  ; VMCS_GUEST_RSP (0x681C) = entry RSP
+  mov rcx, 681Ch
+  mov rdx, r8
+  call hv_vmx_vmwrite_raw
+
+  ; VMCS_GUEST_RIP (0x681E) = <successful_launch>
+  mov rcx, 681Eh
+  lea rdx, successful_launch
+  call hv_vmx_vmwrite_raw
+
+  add rsp, 28h
 
   vmlaunch
 

@@ -2,6 +2,69 @@
 #include "hv.h"
 
 #include <fstream>
+#include <cstdio>
+#include <cstring>
+#include <windows.h>
+#include <psapi.h>
+
+static bool enable_debug_privilege() {
+  HANDLE token = nullptr;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
+    return false;
+
+  LUID luid{};
+  if (!LookupPrivilegeValueA(nullptr, "SeDebugPrivilege", &luid)) {
+    CloseHandle(token);
+    return false;
+  }
+
+  TOKEN_PRIVILEGES tp{};
+  tp.PrivilegeCount           = 1;
+  tp.Privileges[0].Luid       = luid;
+  tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+  AdjustTokenPrivileges(token, FALSE, &tp, sizeof(tp), nullptr, nullptr);
+  auto const gle = GetLastError();
+  CloseHandle(token);
+  return gle == ERROR_SUCCESS;
+}
+
+static bool name_matches(char const* full_path_or_base, char const* want_name) {
+  if (!full_path_or_base || !want_name)
+    return false;
+
+  // compare base name only
+  char const* base = full_path_or_base;
+  for (auto p = full_path_or_base; *p; ++p) {
+    if (*p == '\\' || *p == '/')
+      base = p + 1;
+  }
+
+  // Fast path: exact case-insensitive match (basename vs input)
+  if (_stricmp(base, want_name) == 0)
+    return true;
+
+  // Normalize both sides: strip a trailing ".sys" (case-insensitive) if present.
+  auto strip_sys = [](char* s) {
+    size_t const n = strlen(s);
+    if (n >= 4 && _stricmp(s + (n - 4), ".sys") == 0)
+      s[n - 4] = '\0';
+  };
+
+  char base_copy[MAX_PATH] = {};
+  char want_copy[MAX_PATH] = {};
+  strncpy_s(base_copy, base, _TRUNCATE);
+  strncpy_s(want_copy, want_name, _TRUNCATE);
+
+  strip_sys(base_copy);
+  strip_sys(want_copy);
+
+  // allow matching "hv" <-> "hv.sys"
+  if (_stricmp(base_copy, want_copy) == 0)
+    return true;
+
+  return false;
+}
 
 struct RTL_PROCESS_MODULE_INFORMATION {
   PVOID  Section;
@@ -28,26 +91,67 @@ bool find_loaded_driver(char const* const name, void*& imagebase, uint32_t& imag
   static auto const NtQuerySystemInformation = (NtQuerySystemInformationFn)(
     GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQuerySystemInformation"));
 
-  // get the size of the buffer that we need to allocate
-  unsigned long length = 0;
-  NtQuerySystemInformation(0x0B, nullptr, 0, &length);
+  imagebase = nullptr;
+  imagesize = 0;
 
-  auto const info = (RTL_PROCESS_MODULES*)(new uint8_t[length + 0x200]);
-  NtQuerySystemInformation(0x0B, info, length + 0x200, &length);
+  if (!NtQuerySystemInformation || !name)
+    return false;
 
-  for (unsigned int i = 0; i < info->NumberOfModules; ++i) {
-    auto const& m = info->Modules[i];
-    if (strcmp(m.FullPathName + m.OffsetToFileName, name) != 0)
-      continue;
+  // best-effort: enable SeDebugPrivilege (often required on Win11 for module lists)
+  enable_debug_privilege();
 
-    imagebase = m.ImageBase;
-    imagesize = m.ImageSize;
+  // 1) Preferred: NtQuerySystemInformation(SystemModuleInformation=0x0B)
+  {
+    unsigned long length = 0;
+    auto st = NtQuerySystemInformation(0x0B, nullptr, 0, &length);
+    if (length != 0) {
+      auto const raw = new uint8_t[length + 0x200];
+      ZeroMemory(raw, length + 0x200);
+      auto const info = reinterpret_cast<RTL_PROCESS_MODULES*>(raw);
 
-    delete info;
-    return true;
+      st = NtQuerySystemInformation(0x0B, info, length + 0x200, &length);
+      if (st >= 0) {
+        for (unsigned int i = 0; i < info->NumberOfModules; ++i) {
+          auto const& m = info->Modules[i];
+          if (!name_matches(m.FullPathName + m.OffsetToFileName, name))
+            continue;
+
+          imagebase = m.ImageBase;
+          imagesize = m.ImageSize;
+
+          delete[] raw;
+          return imagebase != nullptr;
+        }
+      }
+
+      delete[] raw;
+    }
   }
 
-  delete info;
+  // 2) Fallback: EnumDeviceDrivers works in many environments where SystemModuleInformation is restricted.
+  {
+    LPVOID drivers[4096] = {};
+    DWORD bytes_needed = 0;
+    if (!EnumDeviceDrivers(drivers, sizeof(drivers), &bytes_needed))
+      return false;
+
+    auto const count = bytes_needed / sizeof(drivers[0]);
+    char base_name[MAX_PATH] = {};
+    for (DWORD i = 0; i < count; ++i) {
+      if (!drivers[i])
+        continue;
+      ZeroMemory(base_name, sizeof(base_name));
+      if (!GetDeviceDriverBaseNameA(drivers[i], base_name, static_cast<DWORD>(sizeof(base_name))))
+        continue;
+      if (!name_matches(base_name, name))
+        continue;
+
+      imagebase = drivers[i];
+      imagesize = 0; // unknown via this API
+      return true;
+    }
+  }
+
   return false;
 }
 

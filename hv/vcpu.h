@@ -107,6 +107,9 @@ struct vcpu {
 
   // used to ensure we only count the stop once per vcpu
   bool stop_notified;
+
+  // whether EPT self-hide has been applied for this vcpu
+  bool ept_hide_applied;
 };
 
 // virtualize the specified cpu. this assumes that execution is already

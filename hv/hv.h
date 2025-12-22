@@ -24,9 +24,18 @@ struct hypervisor {
   struct vcpu* vcpus;
   uint32_t pool_tag;
 
+  // hv image info (for EPT self-hiding)
+  void*  hv_image_base;
+  size_t hv_image_size;
+  uint64_t* hv_image_pfns;
+  uint32_t  hv_image_pfn_count;
+
   // stop/devirtualization coordination (no VMCALL path)
   volatile LONG stop_requested;
   volatile LONG stopped_cpu_count;
+
+  // EPT self-hide: enable after startup completes (applied lazily per-vcpu on first VM-exit)
+  volatile LONG hide_pending;
 
   // pointer to the System process
   uint8_t* system_eprocess;

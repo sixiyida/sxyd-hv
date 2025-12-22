@@ -46,6 +46,10 @@ void emulate_cpuid(vcpu* const cpu) {
   int regs[4];
   __cpuidex(regs, ctx->eax, ctx->ecx);
 
+  if (ctx->eax == 1) {
+    regs[2] &= 0x7FFF'FFFF; // clear Hypervisor Present (ECX bit 31)
+  }
+
   ctx->rax = regs[0];
   ctx->rbx = regs[1];
   ctx->rcx = regs[2];

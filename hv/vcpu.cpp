@@ -17,6 +17,11 @@ extern "C" uint8_t __ImageBase;
 
 namespace hv {
 
+// Unmangled raw wrapper for use from MASM (vm-launch.asm).
+extern "C" void hv_vmx_vmwrite_raw(uint64_t const field, uint64_t const value) {
+  __vmx_vmwrite(field, value);
+}
+
 // defined in vm-launch.asm
 bool vm_launch();
 
@@ -170,18 +175,24 @@ static void enable_mtrr_exiting(vcpu* const cpu) {
 
 // initialize external structures that are not included in the VMCS
 static void prepare_external_structures(vcpu* const cpu) {
+  DbgPrint("[hv] prepare_external_structures: begin.\n");
   memset(&cpu->msr_bitmap, 0, sizeof(cpu->msr_bitmap));
+  DbgPrint("[hv] prepare_external_structures: msr_bitmap ok.\n");
   enable_exit_for_msr_read(cpu->msr_bitmap, IA32_FEATURE_CONTROL, true);
 
   enable_mtrr_exiting(cpu);
+  DbgPrint("[hv] prepare_external_structures: mtrr ok.\n");
 
   // we don't care about anything that's in the TSS
   memset(&cpu->host_tss, 0, sizeof(cpu->host_tss));
+  DbgPrint("[hv] prepare_external_structures: tss ok.\n");
 
   prepare_host_idt(cpu->host_idt);
   prepare_host_gdt(cpu->host_gdt, &cpu->host_tss);
+  DbgPrint("[hv] prepare_external_structures: idt/gdt ok.\n");
 
   prepare_ept(cpu->ept);
+  DbgPrint("[hv] prepare_external_structures: ept ok.\n");
 }
 
 // call the appropriate exit-handler for this vm-exit
@@ -231,6 +242,33 @@ bool handle_vm_exit(guest_context* const ctx) {
   // get the current vcpu
   auto const cpu = reinterpret_cast<vcpu*>(_readfsbase_u64());
   cpu->ctx = ctx;
+
+  // Apply EPT self-hide lazily, only after startup completed.
+  // Important: doing this before VMLAUNCH would remap hv.sys pages and the guest would crash immediately.
+  if (!cpu->ept_hide_applied && ghv.hide_pending &&
+      ghv.hv_image_pfns && ghv.hv_image_pfn_count) {
+    __try {
+      hide_pfns_in_ept(cpu->ept, ghv.hv_image_pfns, ghv.hv_image_pfn_count);
+    } __except (1) {
+      DbgPrint("[hv] handle_vm_exit: hide_pfns_in_ept faulted, skipping.\n");
+    }
+
+    if (cpu->ept.hv_hide_pages_total &&
+        (cpu->ept.hv_hide_pages_faulted >= cpu->ept.hv_hide_pages_total ||
+         cpu->ept.hv_hide_pages_applied == 0)) {
+      DbgPrint("[hv] handle_vm_exit: hide disabled (applied=%u total=%u faulted=%u).\n",
+        cpu->ept.hv_hide_pages_applied,
+        cpu->ept.hv_hide_pages_total,
+        cpu->ept.hv_hide_pages_faulted);
+      cpu->ept.hv_hide_pages_total = 0;
+    } else {
+      DbgPrint("[hv] handle_vm_exit: hide ok (%u/%u pages, faulted=%u).\n",
+        cpu->ept.hv_hide_pages_applied,
+        cpu->ept.hv_hide_pages_total,
+        cpu->ept.hv_hide_pages_faulted);
+      cpu->ept_hide_applied = true;
+    }
+  }
 
   vmx_vmexit_reason reason;
   reason.flags = static_cast<uint32_t>(vmx_vmread(VMCS_EXIT_REASON));

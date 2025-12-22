@@ -28,7 +28,24 @@ static segment_descriptor_interrupt_gate_64 create_interrupt_gate(void* const ha
 
 // initialize the host IDT and populate every descriptor
 void prepare_host_idt(segment_descriptor_interrupt_gate_64* const idt) {
+  // Start by inheriting the current (Windows) IDT so regular hardware interrupts
+  // keep working in VMX root-mode. Leaving entries empty/present=0 will cause
+  // #GP/#DF/#TF and ultimately a triple-fault under load (especially in VMware).
+  segment_descriptor_register_64 idtr;
+  __sidt(&idtr);
+
   memset(idt, 0, host_idt_descriptor_count * sizeof(idt[0]));
+  if (idtr.base_address && idtr.limit) {
+    size_t const bytes = min(static_cast<size_t>(idtr.limit) + 1,
+      host_idt_descriptor_count * sizeof(idt[0]));
+    __try {
+      memcpy(idt, reinterpret_cast<void const*>(idtr.base_address), bytes);
+    } __except (1) {
+      // fall back to empty; we'll override the critical exception vectors below
+    }
+  }
+
+  // Override a set of exception vectors to our own stubs so we can safely handle host faults.
   idt[0]  = create_interrupt_gate(interrupt_handler_0);
   idt[1]  = create_interrupt_gate(interrupt_handler_1);
   idt[2]  = create_interrupt_gate(interrupt_handler_2);

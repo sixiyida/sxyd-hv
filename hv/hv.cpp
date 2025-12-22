@@ -3,6 +3,7 @@
 #include "mm.h"
 #include "arch.h"
 #include "shared-queue.h"
+#include <ntimage.h>
 
 namespace hv {
 
@@ -14,6 +15,8 @@ extern "C" {
 // since we never call these functions anyways
 NTKERNELAPI void PsGetCurrentThreadProcess();
 NTKERNELAPI void PsGetProcessImageFileName();
+extern "C" IMAGE_DOS_HEADER __ImageBase;
+extern "C" PIMAGE_NT_HEADERS NTAPI RtlImageNtHeader(PVOID BaseAddress);
 
 }
 
@@ -120,7 +123,48 @@ static bool create() {
 
   logger_init();
 
+  // record hv image layout for EPT self-hiding
+  {
+    auto nt = RtlImageNtHeader(&__ImageBase);
+    ghv.hv_image_base = &__ImageBase;
+    ghv.hv_image_size = nt ? nt->OptionalHeader.SizeOfImage : 0;
+  }
+
   ghv.pool_tag = generate_pool_tag();
+
+  // precompute hv image PFNs before entering VMX operation (more stable than doing it in root-mode)
+  ghv.hv_image_pfns = nullptr;
+  ghv.hv_image_pfn_count = 0;
+  if (ghv.hv_image_base && ghv.hv_image_size) {
+    size_t const capped_size = (ghv.hv_image_size > 0x2000000ull) ? 0x2000000ull : ghv.hv_image_size;
+    auto const start = reinterpret_cast<uintptr_t>(ghv.hv_image_base) & ~static_cast<uintptr_t>(0xFFF);
+    auto const end = (reinterpret_cast<uintptr_t>(ghv.hv_image_base) + capped_size + 0xFFF) & ~static_cast<uintptr_t>(0xFFF);
+    uint32_t const total_pages = static_cast<uint32_t>((end - start) >> 12);
+
+    if (total_pages > 0 && total_pages < 4096) {
+      auto* const pfns = static_cast<uint64_t*>(ExAllocatePoolWithTag(
+        NonPagedPoolNx, total_pages * sizeof(uint64_t), ghv.pool_tag));
+      if (pfns) {
+        uint32_t count = 0;
+        for (uintptr_t va = start; va < end; va += 0x1000) {
+          auto const vptr = reinterpret_cast<void*>(va);
+          __try {
+            if (!MmIsAddressValid(vptr))
+              continue;
+            auto const phys = MmGetPhysicalAddress(vptr).QuadPart;
+            if (!phys)
+              continue;
+            pfns[count++] = phys >> 12;
+          } __except (1) {
+            // skip faults while walking image pages
+          }
+        }
+
+        ghv.hv_image_pfns = pfns;
+        ghv.hv_image_pfn_count = count;
+      }
+    }
+  }
 
   ghv.vcpu_count = KeQueryActiveProcessorCount(nullptr);
 
@@ -177,6 +221,10 @@ bool start() {
     KeRevertToUserAffinityThreadEx(orig_affinity);
   }
 
+  // Enable EPT self-hide AFTER startup so the guest can finish executing hv.sys code paths.
+  InterlockedExchange(const_cast<LONG*>(&ghv.hide_pending), 1);
+  DbgPrint("[hv] EPT self-hide pending (will apply on first VM-exit per VCPU).\n");
+
   return true;
 }
 
@@ -212,6 +260,13 @@ void stop() {
 
   // 清空共享队列注册，避免残留 CR3/地址在停止后被误用
   clear_all_shared_queues();
+
+  if (ghv.hv_image_pfns) {
+    auto const tag = ghv.pool_tag ? ghv.pool_tag : static_cast<uint32_t>('enoN');
+    ExFreePoolWithTag(ghv.hv_image_pfns, tag);
+    ghv.hv_image_pfns = nullptr;
+    ghv.hv_image_pfn_count = 0;
+  }
 
   if (ghv.vcpus) {
     auto const tag = ghv.pool_tag ? ghv.pool_tag : static_cast<uint32_t>('enoN');

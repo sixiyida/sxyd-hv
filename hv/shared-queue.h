@@ -34,6 +34,8 @@ enum class shared_queue_cmd : uint32_t {
   write_phys,
   read_virt,
   write_virt,
+  // debug: query EPT mapping for a guest VA (returns PFNs)
+  query_ept_map,
 };
 
 enum class shared_queue_entry_status : uint32_t {

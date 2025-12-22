@@ -6,6 +6,17 @@
 
 namespace hv {
 
+static ept_pte* pfn_to_ept_pt_ptr(vcpu_ept_data& ept, uint64_t const pt_pfn) {
+  // PTs created by split_ept_pde() are allocated from ept.free_pages[].
+  // Before VMLAUNCH, host_physical_memory_base may not be mapped in the current CR3,
+  // so we must not rely on it to access those PTs.
+  for (size_t i = 0; i < ept_free_page_count; ++i) {
+    if (ept.free_page_pfns[i] == pt_pfn)
+      return reinterpret_cast<ept_pte*>(&ept.free_pages[i]);
+  }
+  return nullptr;
+}
+
 // identity-map the EPT paging structures
 void prepare_ept(vcpu_ept_data& ept) {
   memset(&ept, 0, sizeof(ept));
@@ -13,6 +24,13 @@ void prepare_ept(vcpu_ept_data& ept) {
   ept.dummy_page_pfn = MmGetPhysicalAddress(ept.dummy_page).QuadPart >> 12;
 
   ept.num_used_free_pages = 0;
+  ept.hv_hide_pages_total = 0;
+  ept.hv_hide_pages_applied = 0;
+  ept.hv_hide_pages_pte_null = 0;
+  ept.hv_hide_pages_invalid_va = 0;
+  ept.hv_hide_pages_phys0 = 0;
+  ept.hv_hide_pages_walked = 0;
+  ept.hv_hide_pages_faulted = 0;
 
   for (size_t i = 0; i < ept_free_page_count; ++i)
     ept.free_page_pfns[i] = MmGetPhysicalAddress(&ept.free_pages[i]).QuadPart >> 12;
@@ -74,6 +92,93 @@ void prepare_ept(vcpu_ept_data& ept) {
   }
 }
 
+// hide a contiguous region [base, base+size) by remapping to dummy_page
+void hide_hv_in_ept(vcpu_ept_data& ept, void* const base, size_t const size) {
+  if (!base || size == 0)
+    return;
+
+  // safety: cap size to avoid runaway in case of corrupt headers
+  size_t const capped_size = (size > 0x2000000ull) ? 0x2000000ull : size; // 32 MiB cap
+
+  auto const start = reinterpret_cast<uintptr_t>(base) & ~static_cast<uintptr_t>(0xFFF);
+  auto const end   = (reinterpret_cast<uintptr_t>(base) + capped_size + 0xFFF) & ~static_cast<uintptr_t>(0xFFF);
+
+  ept.hv_hide_pages_total = static_cast<uint32_t>((end - start) >> 12);
+  ept.hv_hide_pages_applied = 0;
+  ept.hv_hide_pages_pte_null = 0;
+  ept.hv_hide_pages_invalid_va = 0;
+  ept.hv_hide_pages_phys0 = 0;
+  ept.hv_hide_pages_walked = 0;
+  ept.hv_hide_pages_faulted = 0;
+
+  for (uintptr_t va = start; va < end; va += 0x1000) {
+    ept.hv_hide_pages_walked += 1;
+    auto const vptr = reinterpret_cast<void*>(va);
+
+    __try {
+      // avoid touching invalid/unmapped (or discardable) pages
+      if (!MmIsAddressValid(vptr)) {
+        ept.hv_hide_pages_invalid_va += 1;
+        __leave;
+      }
+
+      auto const phys = MmGetPhysicalAddress(vptr).QuadPart;
+      if (!phys) {
+        ept.hv_hide_pages_phys0 += 1;
+        __leave;
+      }
+
+      auto const pte = get_ept_pte(ept, phys, true);
+      if (!pte) {
+        ept.hv_hide_pages_pte_null += 1;
+        __leave;
+      }
+
+      pte->page_frame_number = ept.dummy_page_pfn;
+      ept.hv_hide_pages_applied += 1;
+    }
+    __except (1) {
+      ept.hv_hide_pages_faulted += 1;
+    }
+  }
+}
+
+void hide_pfns_in_ept(vcpu_ept_data& ept, uint64_t const* const pfns, uint32_t const pfn_count) {
+  if (!pfns || pfn_count == 0)
+    return;
+
+  ept.hv_hide_pages_total = pfn_count;
+  ept.hv_hide_pages_walked = 0;
+  ept.hv_hide_pages_applied = 0;
+  ept.hv_hide_pages_pte_null = 0;
+  ept.hv_hide_pages_invalid_va = 0;
+  ept.hv_hide_pages_phys0 = 0;
+  ept.hv_hide_pages_faulted = 0;
+
+  for (uint32_t i = 0; i < pfn_count; ++i) {
+    ept.hv_hide_pages_walked += 1;
+    auto const pfn = pfns[i];
+    if (!pfn) {
+      ept.hv_hide_pages_phys0 += 1;
+      continue;
+    }
+
+    __try {
+      auto const pte = get_ept_pte(ept, pfn << 12, true);
+      if (!pte) {
+        ept.hv_hide_pages_pte_null += 1;
+        __leave;
+      }
+
+      pte->page_frame_number = ept.dummy_page_pfn;
+      ept.hv_hide_pages_applied += 1;
+    }
+    __except (1) {
+      ept.hv_hide_pages_faulted += 1;
+    }
+  }
+}
+
 // update the memory types in the EPT paging structures based on the MTRRs.
 // this function should only be called from root-mode during vmx-operation.
 void update_ept_memory_type(vcpu_ept_data& ept) {
@@ -92,8 +197,10 @@ void update_ept_memory_type(vcpu_ept_data& ept) {
       }
       // PDE points to a PT
       else {
-        auto const pt = reinterpret_cast<ept_pte*>(host_physical_memory_base
-          + (ept.pds[i][j].page_frame_number << 12));
+        auto const pt_pfn = ept.pds[i][j].page_frame_number;
+        auto pt = pfn_to_ept_pt_ptr(ept, pt_pfn);
+        if (!pt)
+          continue;
 
         // update the memory type for every PTE
         for (size_t k = 0; k < 512; ++k) {
@@ -116,8 +223,10 @@ void set_ept_memory_type(vcpu_ept_data& ept, uint8_t const memory_type) {
         pde.memory_type = memory_type;
       // PDE points to a PT
       else {
-        auto const pt = reinterpret_cast<ept_pte*>(host_physical_memory_base
-          + (ept.pds[i][j].page_frame_number << 12));
+        auto const pt_pfn = ept.pds[i][j].page_frame_number;
+        auto pt = pfn_to_ept_pt_ptr(ept, pt_pfn);
+        if (!pt)
+          continue;
 
         // update the memory type for every PTE
         for (size_t k = 0; k < 512; ++k)
@@ -177,10 +286,14 @@ ept_pte* get_ept_pte(vcpu_ept_data& ept,
       return nullptr;
   }
 
-  auto const pt = reinterpret_cast<ept_pte*>(host_physical_memory_base
-    + (ept.pds[addr.pdpt_idx][addr.pd_idx].page_frame_number << 12));
+  // PTs are always allocated from ept.free_pages via split_ept_pde().
+  // Avoid relying on host_physical_memory_base here (it may not be mapped pre-VMLAUNCH).
+  auto const pt_pfn = ept.pds[addr.pdpt_idx][addr.pd_idx].page_frame_number;
+  if (auto direct_pt = pfn_to_ept_pt_ptr(ept, pt_pfn))
+    return &direct_pt[addr.pt_idx];
 
-  return &pt[addr.pt_idx];
+  // Unexpected: PT PFN not from our pool. Fail safely.
+  return nullptr;
 }
 
 // split a 2MB EPT PDE so that it points to an EPT PT

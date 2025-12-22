@@ -25,10 +25,10 @@ void write_vmcs_ctrl_fields(vcpu* const cpu) {
   // 3.24.6.2
   ia32_vmx_procbased_ctls_register proc_based_ctrl;
   proc_based_ctrl.flags                       = 0;
-//#ifndef NDEBUG
+  // NOTE: CR3 load exiting is extremely expensive on Windows (context switches).
+  // Enable only for testing / debugging.
   proc_based_ctrl.cr3_load_exiting            = 1;
-  //proc_based_ctrl.cr3_store_exiting           = 1;
-//#endif
+  //proc_based_ctrl.cr3_store_exiting           = 0;
   proc_based_ctrl.use_msr_bitmaps             = 1;
   proc_based_ctrl.use_tsc_offsetting          = 1;
   proc_based_ctrl.activate_secondary_controls = 1;
@@ -150,6 +150,13 @@ void write_vmcs_host_fields(vcpu const* const cpu) {
   // 3.24.5
   // 3.26.2
 
+  // Snapshot current (Windows) descriptor tables for host-state.
+  // This is critical if we want any inherited IDT entries (hardware interrupts)
+  // to work, since they reference Windows selectors/GDT layout.
+  segment_descriptor_register_64 gdtr, idtr;
+  _sgdt(&gdtr);
+  __sidt(&idtr);
+
   cr3 host_cr3;
   host_cr3.flags                     = 0;
   host_cr3.page_level_cache_disable  = 0;
@@ -177,19 +184,24 @@ void write_vmcs_host_fields(vcpu const* const cpu) {
   vmx_vmwrite(VMCS_HOST_RSP, rsp);
   vmx_vmwrite(VMCS_HOST_RIP, reinterpret_cast<size_t>(vm_exit));
 
-  vmx_vmwrite(VMCS_HOST_CS_SELECTOR, host_cs_selector.flags);
+  // Host selectors must have RPL=0 and TI=0. Use the current Windows selectors.
+  vmx_vmwrite(VMCS_HOST_CS_SELECTOR, read_cs().flags & 0xFFF8);
   vmx_vmwrite(VMCS_HOST_SS_SELECTOR, 0x00);
   vmx_vmwrite(VMCS_HOST_DS_SELECTOR, 0x00);
   vmx_vmwrite(VMCS_HOST_ES_SELECTOR, 0x00);
   vmx_vmwrite(VMCS_HOST_FS_SELECTOR, 0x00);
   vmx_vmwrite(VMCS_HOST_GS_SELECTOR, 0x00);
-  vmx_vmwrite(VMCS_HOST_TR_SELECTOR, host_tr_selector.flags);
+  vmx_vmwrite(VMCS_HOST_TR_SELECTOR, read_tr().flags & 0xFFF8);
 
   vmx_vmwrite(VMCS_HOST_FS_BASE,   reinterpret_cast<size_t>(cpu));
-  vmx_vmwrite(VMCS_HOST_GS_BASE,   0);
-  vmx_vmwrite(VMCS_HOST_TR_BASE,   reinterpret_cast<size_t>(&cpu->host_tss));
-  vmx_vmwrite(VMCS_HOST_GDTR_BASE, reinterpret_cast<size_t>(&cpu->host_gdt));
-  vmx_vmwrite(VMCS_HOST_IDTR_BASE, reinterpret_cast<size_t>(&cpu->host_idt));
+  // Keep Windows GS base (KPCR) so any host interrupt/exception paths that
+  // rely on GS: work correctly in VMX root-mode.
+  vmx_vmwrite(VMCS_HOST_GS_BASE,   __readmsr(IA32_GS_BASE));
+
+  // Use Windows TR/GDTR/IDTR to keep handler stubs compatible with selectors.
+  vmx_vmwrite(VMCS_HOST_TR_BASE,   segment_base(gdtr, read_tr()));
+  vmx_vmwrite(VMCS_HOST_GDTR_BASE, gdtr.base_address);
+  vmx_vmwrite(VMCS_HOST_IDTR_BASE, idtr.base_address);
 
   vmx_vmwrite(VMCS_HOST_SYSENTER_CS,  0);
   vmx_vmwrite(VMCS_HOST_SYSENTER_ESP, 0);

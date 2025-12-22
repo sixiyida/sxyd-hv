@@ -7,7 +7,8 @@ namespace hv {
 struct vcpu;
 
 // number of PDs in the EPT paging structures
-inline constexpr size_t ept_pd_count = 64;
+// each PD covers 1GB, so 512 -> 512GB of identity-mapped physical space
+inline constexpr size_t ept_pd_count = 512;
 inline constexpr size_t ept_free_page_count = 100;
 
 // max number of MMRs
@@ -91,6 +92,15 @@ struct vcpu_ept_data {
   // PTE of the page that we should re-enable memory monitoring on
   ept_pte* mmr_mtf_pte;
   uint8_t  mmr_mtf_mode;
+
+  // EPT self-hide stats (per-vcpu)
+  uint32_t hv_hide_pages_total;
+  uint32_t hv_hide_pages_applied;
+  uint32_t hv_hide_pages_pte_null;
+  uint32_t hv_hide_pages_invalid_va;
+  uint32_t hv_hide_pages_phys0;
+  uint32_t hv_hide_pages_walked;
+  uint32_t hv_hide_pages_faulted;
 };
 
 // identity-map the EPT paging structures
@@ -126,6 +136,12 @@ void remove_ept_hook(vcpu_ept_data& ept, uint64_t original_page_pfn);
 
 // find the EPT hook for the specified PFN
 vcpu_ept_hook_node* find_ept_hook(vcpu_ept_data& ept, uint64_t original_page_pfn);
+
+// hide a contiguous region [base, base+size) by remapping to dummy_page
+void hide_hv_in_ept(vcpu_ept_data& ept, void* base, size_t size);
+
+// hide a list of PFNs by remapping each page to dummy_page
+void hide_pfns_in_ept(vcpu_ept_data& ept, uint64_t const* pfns, uint32_t pfn_count);
 
 } // namespace hv
 

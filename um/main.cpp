@@ -133,6 +133,22 @@ int main() {
   qhdr->head = 3; // 发布 3 个条目（nop + write_virt + read_virt）
   _mm_mfence();
 
+  // 在某些环境（尤其 nested/VMware）里，VMX preemption timer 可能不可用或不稳定，
+  // 导致 HV 没有新的 VM-exit 来轮询共享队列。这里做一个“kick”：再触发一次同样的 CPUID 握手，
+  // 以强制产生 vm-exit，让 HV 立即处理队列。
+  {
+    printf("[um] kicking HV to process queue...\n");
+    fflush(stdout);
+    __try {
+      auto const ks = hv::queue_handshake(req);
+      printf("[um] kick result: signature=%llX status=%u pages=%u magic_echo=%llX\n",
+        ks.signature, static_cast<uint32_t>(ks.status), ks.page_count, ks.echoed_magic);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+      printf("[um][warn] kick threw exception: 0x%08X\n", GetExceptionCode());
+    }
+    fflush(stdout);
+  }
+
   // 轮询检查 tail 是否前进，验证队列消费
   while (!GetAsyncKeyState(VK_RETURN)) {
     static bool entry0_reported = false;
@@ -167,6 +183,45 @@ int main() {
       break;
 
     Sleep(200);
+  }
+
+  // 5) 验证 EPT 自隐藏是否生效：
+  // 注意：通过 shared queue 的 read_virt 是 HV root-mode 直接读物理内存，不经过 EPT，
+  // 所以即使 hide 生效也可能依然看到 "MZ"。这里改为查询 EPT 对该 VA 的映射结果。
+  void* hv_base = nullptr;
+  uint32_t hv_size = 0;
+  if (find_loaded_driver("hv.sys", hv_base, hv_size)) {
+    printf("[um] hv.sys base=%p size=0x%X\n", hv_base, hv_size);
+
+    ZeroMemory(&qent[3], sizeof(hv::shared_queue_entry));
+    qent[3].cmd    = static_cast<uint32_t>(hv::shared_queue_cmd::query_ept_map);
+    qent[3].status = static_cast<uint32_t>(hv::shared_queue_entry_status::pending);
+    qent[3].cr3    = 0; // current guest CR3
+    qent[3].gva    = reinterpret_cast<uint64_t>(hv_base); // kernel VA
+
+    _mm_mfence();
+    qhdr->head = 4;
+    _mm_mfence();
+
+    // wait for entry 3
+    for (int i = 0; i < 50; ++i) { // ~10s
+      if (qhdr->tail > 3 &&
+          qent[3].status == static_cast<uint32_t>(hv::shared_queue_entry_status::done)) {
+        auto const orig_pfn  = qent[3].gpa;
+        auto const mapped_pfn = qent[3].aux;
+        auto const dummy_pfn  = qent[3].reserved;
+        printf("[um] EPT map for hv.sys base: orig_pfn=0x%llX mapped_pfn=0x%llX dummy_pfn=0x%llX\n",
+          orig_pfn, mapped_pfn, dummy_pfn);
+        if (dummy_pfn != 0 && mapped_pfn == dummy_pfn)
+          printf("[um][ok] EPT self-hide effective (mapped to dummy).\n");
+        else
+          printf("[um][warn] EPT self-hide NOT effective for this VA (not mapped to dummy).\n");
+        break;
+      }
+      Sleep(200);
+    }
+  } else {
+    printf("[um][warn] failed to locate hv.sys in loaded module list; skip self-hide check.\n");
   }
 
   // 6) 在退出前显式注销共享队列，避免退出后 CR3/页复用导致 HV 继续写旧队列

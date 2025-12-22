@@ -7,6 +7,14 @@
 
 namespace hv {
 
+template <typename T>
+static bool read_host_mapped_phys(T& out, uint64_t const phys) {
+  host_exception_info e{};
+  auto const src = host_physical_memory_base + phys;
+  memcpy_safe(e, &out, src, sizeof(T));
+  return !e.exception_occurred;
+}
+
 // translate a GVA to a GPA. offset_to_next_page is the number of bytes to
 // the next page (i.e. the number of bytes that can be safely accessed through
 // the GPA in order to modify the GVA.
@@ -16,18 +24,26 @@ uint64_t gva2gpa(cr3 const guest_cr3, void* const gva, size_t* const offset_to_n
 
   pml4_virtual_address const vaddr = { gva };
 
-  // guest PML4
-  auto const pml4 = reinterpret_cast<pml4e_64*>(host_physical_memory_base
-    + (guest_cr3.address_of_page_directory << 12));
-  auto const pml4e = pml4[vaddr.pml4_idx];
+  // guest PML4 (safe read: host_physical_memory_base may not cover all PFNs)
+  pml4e_64 pml4e{};
+  {
+    uint64_t const pml4_phys = (guest_cr3.address_of_page_directory << 12)
+      + (static_cast<uint64_t>(vaddr.pml4_idx) * sizeof(pml4e_64));
+    if (!read_host_mapped_phys(pml4e, pml4_phys))
+      return 0;
+  }
 
   if (!pml4e.present)
     return 0;
 
   // guest PDPT
-  auto const pdpt = reinterpret_cast<pdpte_64*>(host_physical_memory_base
-    + (pml4e.page_frame_number << 12));
-  auto const pdpte = pdpt[vaddr.pdpt_idx];
+  pdpte_64 pdpte{};
+  {
+    uint64_t const pdpt_phys = (pml4e.page_frame_number << 12)
+      + (static_cast<uint64_t>(vaddr.pdpt_idx) * sizeof(pdpte_64));
+    if (!read_host_mapped_phys(pdpte, pdpt_phys))
+      return 0;
+  }
 
   if (!pdpte.present)
     return 0;
@@ -46,9 +62,13 @@ uint64_t gva2gpa(cr3 const guest_cr3, void* const gva, size_t* const offset_to_n
   }
 
   // guest PD
-  auto const pd = reinterpret_cast<pde_64*>(host_physical_memory_base
-    + (pdpte.page_frame_number << 12));
-  auto const pde = pd[vaddr.pd_idx];
+  pde_64 pde{};
+  {
+    uint64_t const pd_phys = (pdpte.page_frame_number << 12)
+      + (static_cast<uint64_t>(vaddr.pd_idx) * sizeof(pde_64));
+    if (!read_host_mapped_phys(pde, pd_phys))
+      return 0;
+  }
 
   if (!pde.present)
     return 0;
@@ -67,9 +87,13 @@ uint64_t gva2gpa(cr3 const guest_cr3, void* const gva, size_t* const offset_to_n
   }
 
   // guest PT
-  auto const pt = reinterpret_cast<pte_64*>(host_physical_memory_base
-    + (pde.page_frame_number << 12));
-  auto const pte = pt[vaddr.pt_idx];
+  pte_64 pte{};
+  {
+    uint64_t const pt_phys = (pde.page_frame_number << 12)
+      + (static_cast<uint64_t>(vaddr.pt_idx) * sizeof(pte_64));
+    if (!read_host_mapped_phys(pte, pt_phys))
+      return 0;
+  }
 
   if (!pte.present)
     return 0;
