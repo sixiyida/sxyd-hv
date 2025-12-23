@@ -64,6 +64,8 @@ enum class shared_queue_cmd : uint32_t {
   write_virt,
   // debug: query EPT mapping for a guest VA (returns PFNs)
   query_ept_map,
+  // request global devirtualization (used when VMCALL/hypercalls are disabled)
+  devirt_all,
 };
 
 enum class shared_queue_entry_status : uint32_t {
@@ -293,6 +295,14 @@ inline uint64_t test(uint64_t const a1, uint64_t const a2,
   input.args[4] = a5;
   input.args[5] = a6;
   return hv::detail::vmx_vmcall_safe(input);
+}
+
+// devirtualize the CURRENT logical processor ONLY
+inline void unload() {
+  hv::hypercall_input input{};
+  input.code = hv::hypercall_unload;
+  input.key  = hv::hypercall_key;
+  hv::detail::vmx_vmcall_safe(input);
 }
 
 // read from arbitrary physical memory

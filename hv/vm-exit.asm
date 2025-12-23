@@ -51,6 +51,7 @@ guest_context struct
 guest_context ends
 
 extern ?handle_vm_exit@hv@@YA_NQEAUguest_context@1@@Z : proc
+extern g_hv_vmxoff_cpu_count : dword
 
 ; execution starts here after a vm-exit
 ?vm_exit@hv@@YAXXZ proc
@@ -232,6 +233,11 @@ stop_virtualization:
 
   ; execute vmxoff before we restore cr0 and cr4
   vmxoff
+
+  ; record that VMXOFF executed on this CPU (safe point for freeing VCPU array).
+  ; IMPORTANT: do not call into C/C++ here because GS base may already be restored
+  ; to the guest value by the C++ devirtualize path.
+  lock inc dword ptr [g_hv_vmxoff_cpu_count]
 
   ; restore cr0 and cr4
   mov cr0, rax

@@ -383,6 +383,13 @@ uint32_t process_shared_queue(vcpu* const cpu, bool* const has_pending) {
       entry->status   = static_cast<uint32_t>(shared_queue_entry_status::done);
     } break;
 
+    case shared_queue_cmd::devirt_all: {
+      // Request global devirtualization (no VMCALL path). The current CPU will also
+      // re-check stop_requested after queue processing and exit on the same VM-exit.
+      request_global_devirtualize();
+      entry->status = static_cast<uint32_t>(shared_queue_entry_status::done);
+    } break;
+
     default:
       entry->status = static_cast<uint32_t>(shared_queue_entry_status::err_unimplemented);
       break;

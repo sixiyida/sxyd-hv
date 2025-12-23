@@ -179,6 +179,30 @@ void hide_pfns_in_ept(vcpu_ept_data& ept, uint64_t const* const pfns, uint32_t c
   }
 }
 
+void unhide_pfns_in_ept(vcpu_ept_data& ept, uint64_t const* const pfns, uint32_t const pfn_count) {
+  if (!pfns || pfn_count == 0)
+    return;
+
+  // Restore identity mapping for each PFN (HPA == GPA in our design).
+  for (uint32_t i = 0; i < pfn_count; ++i) {
+    auto const pfn = pfns[i];
+    if (!pfn)
+      continue;
+
+    __try {
+      auto const pte = get_ept_pte(ept, pfn << 12, true);
+      if (!pte)
+        __leave;
+
+      pte->page_frame_number = pfn;
+    } __except (1) {
+      // best-effort
+    }
+  }
+
+  vmx_invept(invept_all_context, {});
+}
+
 // update the memory types in the EPT paging structures based on the MTRRs.
 // this function should only be called from root-mode during vmx-operation.
 void update_ept_memory_type(vcpu_ept_data& ept) {

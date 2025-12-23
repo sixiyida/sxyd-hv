@@ -1,18 +1,124 @@
 #include <iostream>
 #include <cstdio>
+#include <string>
+#include <cstring>
 
 #include "hv.h"
 #include "dumper.h"
 
-int main() {
+static void usage(char const* const exe) {
+  printf("usage:\n");
+  printf("  %s --menu         # interactive menu (recommended)\n", exe);
+  printf("  %s --devirt-all    # run hypercall_unload on every CPU (useful before unloading hv.sys when EPT self-hide is enabled)\n", exe);
+  printf("  %s --demo          # run the shared-queue demo (legacy behavior)\n", exe);
+  printf("  %s --help\n", exe);
+}
+
+static void wait_enter() {
+  printf("Press Enter to continue...\n");
+  fflush(stdout);
+  std::string _;
+  std::getline(std::cin, _);
+}
+
+static bool ensure_hv_running() {
   if (!hv::is_hv_running()) {
-    printf("[um] HV not running.\n");
-    printf("Press Enter to exit.\n");
-    getchar();
+    printf("[um][err] HV not running.\n");
+    return false;
+  }
+  return true;
+}
+
+static void action_ping() {
+  if (!ensure_hv_running())
+    return;
+  auto const sig = hv::ping();
+  printf("[um] ping => 0x%llX\n", sig);
+}
+
+static void action_test() {
+  if (!ensure_hv_running())
+    return;
+  auto const r = hv::test(1, 2, 3, 4, 5, 6);
+  printf("[um] test => 0x%llX\n", r);
+}
+
+static void action_devirt_all() {
+  if (!ensure_hv_running())
+    return;
+
+  printf("[um] Requesting global devirtualization via shared queue...\n");
+  fflush(stdout);
+
+  // Allocate a small shared queue (2 pages) and register it via CPUID handshake.
+  constexpr size_t queue_size = 0x2000;
+  uint8_t* queue = static_cast<uint8_t*>(
+    VirtualAlloc(nullptr, queue_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+
+  if (!queue) {
+    printf("[um][err] VirtualAlloc failed (gle=0x%08X).\n", GetLastError());
+    return;
+  }
+
+  if (!VirtualLock(queue, queue_size)) {
+    printf("[um][err] VirtualLock failed (gle=0x%08X).\n", GetLastError());
+    VirtualFree(queue, 0, MEM_RELEASE);
+    return;
+  }
+
+  memset(queue, 0, queue_size);
+
+  hv::queue_handshake_request req{};
+  req.queue = queue;
+  req.size  = static_cast<uint32_t>(queue_size);
+  req.magic = 0xC0FFEE123456789ull;
+  req.seed  = 0xBADF00DCAFEBABEull;
+
+  auto const hs = hv::queue_handshake(req);
+  printf("[um] queue handshake: signature=0x%llX status=%u pages=%u magic_echo=0x%llX\n",
+    hs.signature, static_cast<uint32_t>(hs.status), hs.page_count, hs.echoed_magic);
+
+  if (hs.signature != hv::hypervisor_signature ||
+      hs.status != hv::queue_register_status::success) {
+    printf("[um][err] handshake failed.\n");
+    VirtualUnlock(queue, queue_size);
+    VirtualFree(queue, 0, MEM_RELEASE);
+    return;
+  }
+
+  // Enqueue a single "devirt_all" command.
+  auto* qhdr = hv::sq_header(queue);
+  auto* qent = hv::sq_entries(queue);
+  qhdr->head = 0;
+  qhdr->tail = 0;
+
+  ZeroMemory(&qent[0], sizeof(hv::shared_queue_entry));
+  qent[0].cmd    = static_cast<uint32_t>(hv::shared_queue_cmd::devirt_all);
+  qent[0].status = static_cast<uint32_t>(hv::shared_queue_entry_status::pending);
+
+  _mm_mfence();
+  qhdr->head = 1;
+  _mm_mfence();
+
+  // Kick HV: repeat handshake to force a VM-exit, then it will process the queue.
+  auto const ks = hv::queue_handshake(req);
+  printf("[um] kick result: signature=0x%llX status=%u pages=%u magic_echo=0x%llX\n",
+    ks.signature, static_cast<uint32_t>(ks.status), ks.page_count, ks.echoed_magic);
+
+  printf("[um] Requested. Now stop/unload hv.sys via SCM. Keep this program running until done.\n");
+  wait_enter();
+
+  VirtualUnlock(queue, queue_size);
+  VirtualFree(queue, 0, MEM_RELEASE);
+}
+
+static int action_shared_queue_demo() {
+  if (!ensure_hv_running()) {
+    wait_enter();
     return 0;
   }
 
-  // 1) 分配并锁定一块共享队列内存（示例：8KB，足够放元数据+ring）
+  // 1) Allocate & lock a shared queue buffer (example: 8KB).
   constexpr size_t queue_size = 0x2000;
   printf("[um] allocating queue size=0x%zx bytes.\n", queue_size);
   uint8_t* queue = static_cast<uint8_t*>(
@@ -33,10 +139,10 @@ int main() {
     return 0;
   }
 
-  // 填充队列页，避免未触摸导致的懒分配
+  // Touch pages to avoid lazy allocation.
   memset(queue, 0xA5, queue_size);
 
-  // 2) 进行 CPUID 握手注册
+  // 2) Register via CPUID handshake.
   printf("[um] queue ptr=%p\n", queue);
   fflush(stdout);
   hv::queue_handshake_request req{};
@@ -73,22 +179,22 @@ int main() {
     return 0;
   }
 
-  // TODO: 将后续队列生产者逻辑接入这里（填充描述符、推进 head 等）。
+  // TODO: Hook more producer logic here (fill descriptors, advance head, etc).
 
   printf("[um] handshake OK, continuing to hide HV pages...\n");
   fflush(stdout);
 
-  // 3) 简单写入一个 NOP 条目，验证队列消费
+  // 3) Publish a NOP entry to validate queue consumption.
   auto* qhdr = hv::sq_header(queue);
   auto* qent = hv::sq_entries(queue);
   qhdr->head = 0;
   qhdr->tail = 0;
 
-  // 在队列内预留一块数据区（第二页）作为读写缓冲，避免覆盖描述符
+  // Reserve a scratch area inside the queue (page #2) for read/write buffers.
   uint8_t* scratch = reinterpret_cast<uint8_t*>(reinterpret_cast<uint8_t*>(queue) + 0x1000);
   ZeroMemory(scratch, 0x200);
 
-  // 清理首个条目，避免 0xA5 填充影响日志
+  // Clear the first entry to avoid 0xA5 pattern affecting logs.
   ZeroMemory(&qent[0], sizeof(hv::shared_queue_entry));
   qent[0].cmd    = static_cast<uint32_t>(hv::shared_queue_cmd::nop);
   qent[0].status = static_cast<uint32_t>(hv::shared_queue_entry_status::pending);
@@ -96,12 +202,12 @@ int main() {
   qent[0].flags  = 0;
   qent[0].aux    = 0;
 
-  // 发布 head=1
+  // Publish head=1
   _mm_mfence();
   qhdr->head = 1;
   _mm_mfence();
 
-  // 4) 准备 virt 测试缓冲
+  // 4) Prepare virt test buffers
   auto* virt_src = scratch + 0x100; // 0x80 bytes
   auto* virt_dst = scratch + 0x180; // 0x80 bytes
   for (size_t i = 0; i < 0x80; ++i)
@@ -112,9 +218,9 @@ int main() {
   ZeroMemory(&qent[1], sizeof(hv::shared_queue_entry));
   qent[1].cmd    = static_cast<uint32_t>(hv::shared_queue_cmd::write_virt);
   qent[1].status = static_cast<uint32_t>(hv::shared_queue_entry_status::pending);
-  qent[1].cr3    = 0; // 0 表示当前 cr3
-  qent[1].gva    = reinterpret_cast<uint64_t>(virt_dst); // 目标 VA
-  qent[1].gpa    = reinterpret_cast<uint64_t>(virt_src); // 源 VA
+  qent[1].cr3    = 0; // 0 = current CR3
+  qent[1].gva    = reinterpret_cast<uint64_t>(virt_dst); // dst VA
+  qent[1].gpa    = reinterpret_cast<uint64_t>(virt_src); // src VA
   qent[1].size   = 0x80;
 
   // read_virt: src=virt_dst (target), dst=virt_dst2 (current)
@@ -124,18 +230,18 @@ int main() {
   ZeroMemory(&qent[2], sizeof(hv::shared_queue_entry));
   qent[2].cmd    = static_cast<uint32_t>(hv::shared_queue_cmd::read_virt);
   qent[2].status = static_cast<uint32_t>(hv::shared_queue_entry_status::pending);
-  qent[2].cr3    = 0; // 当前 cr3
-  qent[2].gva    = reinterpret_cast<uint64_t>(virt_dst);  // 源 VA
-  qent[2].gpa    = reinterpret_cast<uint64_t>(virt_dst2); // 目标 VA
+  qent[2].cr3    = 0; // current CR3
+  qent[2].gva    = reinterpret_cast<uint64_t>(virt_dst);  // src VA
+  qent[2].gpa    = reinterpret_cast<uint64_t>(virt_dst2); // dst VA
   qent[2].size   = 0x80;
 
   _mm_mfence();
-  qhdr->head = 3; // 发布 3 个条目（nop + write_virt + read_virt）
+  qhdr->head = 3; // publish 3 entries (nop + write_virt + read_virt)
   _mm_mfence();
 
-  // 在某些环境（尤其 nested/VMware）里，VMX preemption timer 可能不可用或不稳定，
-  // 导致 HV 没有新的 VM-exit 来轮询共享队列。这里做一个“kick”：再触发一次同样的 CPUID 握手，
-  // 以强制产生 vm-exit，让 HV 立即处理队列。
+  // In some environments (nested/VMware), the VMX preemption timer may be unstable,
+  // causing no new VM-exits to poll the shared queue. Do a "kick" by repeating the
+  // CPUID handshake to force a VM-exit and process the queue promptly.
   {
     printf("[um] kicking HV to process queue...\n");
     fflush(stdout);
@@ -149,7 +255,7 @@ int main() {
     fflush(stdout);
   }
 
-  // 轮询检查 tail 是否前进，验证队列消费
+  // Poll tail to verify consumption.
   while (!GetAsyncKeyState(VK_RETURN)) {
     static bool entry0_reported = false;
     static bool entry1_reported = false;
@@ -185,9 +291,9 @@ int main() {
     Sleep(200);
   }
 
-  // 5) 验证 EPT 自隐藏是否生效：
-  // 注意：通过 shared queue 的 read_virt 是 HV root-mode 直接读物理内存，不经过 EPT，
-  // 所以即使 hide 生效也可能依然看到 "MZ"。这里改为查询 EPT 对该 VA 的映射结果。
+  // 5) Validate whether EPT self-hide is effective:
+  // NOTE: shared-queue read_virt reads physical memory in root-mode and does NOT go through EPT,
+  // so you may still see "MZ" even if hide is effective. We query EPT mapping instead.
   void* hv_base = nullptr;
   uint32_t hv_size = 0;
   if (find_loaded_driver("hv.sys", hv_base, hv_size)) {
@@ -224,7 +330,7 @@ int main() {
     printf("[um][warn] failed to locate hv.sys in loaded module list; skip self-hide check.\n");
   }
 
-  // 6) 在退出前显式注销共享队列，避免退出后 CR3/页复用导致 HV 继续写旧队列
+  // 6) Deregister the shared queue before exit to avoid CR3/page reuse issues.
   hv::queue_handshake_request dereg{};
   dereg.queue = nullptr;
   dereg.size  = 0;
@@ -238,8 +344,83 @@ int main() {
     printf("[um][warn] deregister threw exception: 0x%08X\n", GetExceptionCode());
   }
 
-  printf("[um] exiting, press Enter.\n");
+  printf("[um] exiting.\n");
   fflush(stdout);
-  getchar();
+  wait_enter();
+  return 0;
 }
 
+static void run_menu() {
+  for (;;) {
+    printf("\n========== hv um menu ==========\n");
+    printf("1) ping (check if HV is running)\n");
+    printf("2) test (example hypercall)\n");
+    printf("3) shared-queue demo\n");
+    printf("4) devirt-all (run hypercall_unload on each CPU; use before unloading hv.sys when self-hide is enabled)\n");
+    printf("0) exit\n");
+    printf("Select: ");
+    fflush(stdout);
+
+    std::string line;
+    if (!std::getline(std::cin, line))
+      return;
+    if (line.empty())
+      continue;
+
+    int choice = -1;
+    try {
+      choice = std::stoi(line);
+    } catch (...) {
+      printf("[um][err] invalid input: %s\n", line.c_str());
+      continue;
+    }
+
+    switch (choice) {
+    case 1:
+      action_ping();
+      wait_enter();
+      break;
+    case 2:
+      action_test();
+      wait_enter();
+      break;
+    case 3:
+      action_shared_queue_demo();
+      break;
+    case 4:
+      action_devirt_all();
+      wait_enter();
+      break;
+    case 0:
+      return;
+    default:
+      printf("[um][err] unknown option: %d\n", choice);
+      break;
+    }
+  }
+}
+
+int main(int argc, char** argv) {
+  if (argc >= 2 && (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0)) {
+    usage(argv[0]);
+    return 0;
+  }
+
+  if (argc >= 2 && strcmp(argv[1], "--devirt-all") == 0) {
+    action_devirt_all();
+    return 0;
+  }
+
+  if (argc >= 2 && strcmp(argv[1], "--demo") == 0) {
+    return action_shared_queue_demo();
+  }
+
+  // Default: interactive menu.
+  if (argc >= 2 && strcmp(argv[1], "--menu") != 0) {
+    printf("[um][warn] unknown arg: %s\n", argv[1]);
+    usage(argv[0]);
+  }
+
+  run_menu();
+  return 0;
+}

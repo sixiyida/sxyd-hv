@@ -4,10 +4,26 @@
 #include "arch.h"
 #include "shared-queue.h"
 #include <ntimage.h>
+#include <intrin.h>
 
 namespace hv {
+// NOTE: EPT self-hide is experimental and can easily destabilize unload/startup on new kernels.
+// Keep it disabled by default while debugging stability issues.
+#ifndef HV_ENABLE_EPT_SELF_HIDE
+#define HV_ENABLE_EPT_SELF_HIDE 1
+#endif
+// Force a VM-exit on each logical processor by executing CPUID.
+// This is used to make hv::stop() deterministic even when VM-exits are rare.
+static ULONG_PTR ipi_kick_vmexit(ULONG_PTR /*ctx*/) {
+  int info[4] = {};
+  __cpuid(info, 0);
+  return 0;
+}
 
 hypervisor ghv;
+
+// incremented from vm-exit.asm (lock inc) after VMXOFF executes on a VCPU.
+extern "C" volatile LONG g_hv_vmxoff_cpu_count = 0;
 
 extern "C" {
 
@@ -133,8 +149,10 @@ static bool create() {
   ghv.pool_tag = generate_pool_tag();
 
   // precompute hv image PFNs before entering VMX operation (more stable than doing it in root-mode)
+  // Only needed for EPT self-hide.
   ghv.hv_image_pfns = nullptr;
   ghv.hv_image_pfn_count = 0;
+#if HV_ENABLE_EPT_SELF_HIDE
   if (ghv.hv_image_base && ghv.hv_image_size) {
     size_t const capped_size = (ghv.hv_image_size > 0x2000000ull) ? 0x2000000ull : ghv.hv_image_size;
     auto const start = reinterpret_cast<uintptr_t>(ghv.hv_image_base) & ~static_cast<uintptr_t>(0xFFF);
@@ -165,6 +183,7 @@ static bool create() {
       }
     }
   }
+#endif
 
   ghv.vcpu_count = KeQueryActiveProcessorCount(nullptr);
 
@@ -222,8 +241,12 @@ bool start() {
   }
 
   // Enable EPT self-hide AFTER startup so the guest can finish executing hv.sys code paths.
+#if HV_ENABLE_EPT_SELF_HIDE
   InterlockedExchange(const_cast<LONG*>(&ghv.hide_pending), 1);
   DbgPrint("[hv] EPT self-hide pending (will apply on first VM-exit per VCPU).\n");
+#else
+  InterlockedExchange(const_cast<LONG*>(&ghv.hide_pending), 0);
+#endif
 
   return true;
 }
@@ -237,29 +260,73 @@ void stop() {
   if (!ghv.vcpus || ghv.vcpu_count == 0)
     return;
 
+  // Prevent any further (re)hiding while we are stopping/unloading.
+  InterlockedExchange(const_cast<LONG*>(&ghv.hide_pending), 0);
+
+  // If VMX is already off on all CPUs (e.g. user-mode devirtualized each core via hypercall),
+  // just do best-effort cleanup without trying to trigger new VM-exits.
+  if (ghv.vcpus && ghv.vcpu_count &&
+      static_cast<unsigned long>(g_hv_vmxoff_cpu_count) >= ghv.vcpu_count) {
+    clear_all_shared_queues();
+
+    if (ghv.hv_image_pfns) {
+      auto const tag = ghv.pool_tag ? ghv.pool_tag : static_cast<uint32_t>('enoN');
+      ExFreePoolWithTag(ghv.hv_image_pfns, tag);
+      ghv.hv_image_pfns = nullptr;
+      ghv.hv_image_pfn_count = 0;
+    }
+
+    auto const tag = ghv.pool_tag ? ghv.pool_tag : static_cast<uint32_t>('enoN');
+    ExFreePoolWithTag(ghv.vcpus, tag);
+    ghv.vcpus = nullptr;
+    ghv.vcpu_count = 0;
+
+    InterlockedExchange(const_cast<LONG*>(&ghv.stop_requested), 0);
+    InterlockedExchange(const_cast<LONG*>(&ghv.hide_pending), 0);
+    InterlockedExchange(const_cast<LONG*>(&g_hv_vmxoff_cpu_count), 0);
+    return;
+  }
+
   // reset per-vcpu notification flags
-  for (unsigned long i = 0; i < ghv.vcpu_count; ++i)
+  for (unsigned long i = 0; i < ghv.vcpu_count; ++i) {
     ghv.vcpus[i].stop_notified = false;
+  }
 
   InterlockedExchange(const_cast<LONG*>(&ghv.stopped_cpu_count), 0);
+  InterlockedExchange(const_cast<LONG*>(&g_hv_vmxoff_cpu_count), 0);
   InterlockedExchange(const_cast<LONG*>(&ghv.stop_requested), 1);
 
-  // wait for all vcpus to exit VMX (triggered on next VM-exit)
+  // IMPORTANT (EPT self-hide):
+  // If hv.sys pages are hidden in the guest, using KeIpiGenericCall with a hv.sys function pointer
+  // is unsafe because the guest would execute hidden hv.sys code. In self-hide mode, rely on
+  // VMX preemption timer / normal VM-exits to observe stop_requested instead of IPI-calling hv.sys.
+#if !HV_ENABLE_EPT_SELF_HIDE
+  // Kick every CPU to ensure we get a VM-exit promptly and observe stop_requested.
+  // Without this, stop can hang indefinitely if the guest isn't executing exit-causing instructions.
+  KeIpiGenericCall(ipi_kick_vmexit, 0);
+#endif
+
+  // wait for all vcpus to execute VMXOFF (triggered on next VM-exit)
   LARGE_INTEGER interval;
   interval.QuadPart = -10 * 1000 * 10; // 10ms
 
   uint32_t spins = 0;
-  while (static_cast<unsigned long>(ghv.stopped_cpu_count) < ghv.vcpu_count && spins++ < 1000) {
+  while (static_cast<unsigned long>(g_hv_vmxoff_cpu_count) < ghv.vcpu_count && spins++ < 3000) {
     KeDelayExecutionThread(KernelMode, FALSE, &interval);
   }
 
-  if (static_cast<unsigned long>(ghv.stopped_cpu_count) < ghv.vcpu_count) {
-    DbgPrint("[hv] stop(): timeout waiting for vcpus to devirtualize (%ld/%lu).\n",
-      ghv.stopped_cpu_count, ghv.vcpu_count);
+  if (static_cast<unsigned long>(g_hv_vmxoff_cpu_count) < ghv.vcpu_count) {
+    DbgPrint("[hv] stop(): timeout waiting for vcpus to VMXOFF (%ld/%lu, stopSeen=%ld).\n",
+      g_hv_vmxoff_cpu_count, ghv.vcpu_count, ghv.stopped_cpu_count);
   }
 
   // 清空共享队列注册，避免残留 CR3/地址在停止后被误用
   clear_all_shared_queues();
+
+  // If not all CPUs executed VMXOFF, do NOT free memory.
+  // Freeing the VCPU array early can corrupt kernel memory and crash in IopUnloadDriver.
+  if (static_cast<unsigned long>(g_hv_vmxoff_cpu_count) < ghv.vcpu_count)
+    return;
 
   if (ghv.hv_image_pfns) {
     auto const tag = ghv.pool_tag ? ghv.pool_tag : static_cast<uint32_t>('enoN');
@@ -276,6 +343,23 @@ void stop() {
   }
 
   InterlockedExchange(const_cast<LONG*>(&ghv.stop_requested), 0);
+}
+
+void request_global_devirtualize() {
+  // Best-effort: if we're not initialized, nothing to do.
+  if (!ghv.vcpus || ghv.vcpu_count == 0)
+    return;
+
+  // Prevent any further (re)hiding while we are stopping/unloading.
+  InterlockedExchange(const_cast<LONG*>(&ghv.hide_pending), 0);
+
+  // Request devirtualization.
+  InterlockedExchange(const_cast<LONG*>(&ghv.stop_requested), 1);
+
+  // See comment in stop(): in EPT self-hide mode we must not IPI-call hv.sys code from the guest.
+#if !HV_ENABLE_EPT_SELF_HIDE
+  KeIpiGenericCall(ipi_kick_vmexit, 0);
+#endif
 }
 
 } // namespace hv

@@ -25,9 +25,9 @@ void write_vmcs_ctrl_fields(vcpu* const cpu) {
   // 3.24.6.2
   ia32_vmx_procbased_ctls_register proc_based_ctrl;
   proc_based_ctrl.flags                       = 0;
-  // NOTE: CR3 load exiting is extremely expensive on Windows (context switches).
-  // Enable only for testing / debugging.
-  proc_based_ctrl.cr3_load_exiting            = 1;
+  // NOTE: CR3 load exiting is extremely expensive on Windows (context switches) and
+  // can destabilize the system if the handler isn't perfect. Keep it disabled by default.
+  proc_based_ctrl.cr3_load_exiting            = 0;
   //proc_based_ctrl.cr3_store_exiting           = 0;
   proc_based_ctrl.use_msr_bitmaps             = 1;
   proc_based_ctrl.use_tsc_offsetting          = 1;

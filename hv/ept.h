@@ -143,5 +143,8 @@ void hide_hv_in_ept(vcpu_ept_data& ept, void* base, size_t size);
 // hide a list of PFNs by remapping each page to dummy_page
 void hide_pfns_in_ept(vcpu_ept_data& ept, uint64_t const* pfns, uint32_t pfn_count);
 
+// unhide a list of PFNs by restoring identity mapping (PFN -> PFN)
+void unhide_pfns_in_ept(vcpu_ept_data& ept, uint64_t const* pfns, uint32_t pfn_count);
+
 } // namespace hv
 

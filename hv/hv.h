@@ -62,5 +62,9 @@ bool start();
 // devirtualize the current system
 void stop();
 
+// Request global devirtualization from root-mode (e.g. via shared queue command).
+// This only sets the stop request and kicks all CPUs to get a VM-exit promptly.
+void request_global_devirtualize();
+
 } // namespace hv
 

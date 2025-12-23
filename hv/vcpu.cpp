@@ -245,7 +245,7 @@ bool handle_vm_exit(guest_context* const ctx) {
 
   // Apply EPT self-hide lazily, only after startup completed.
   // Important: doing this before VMLAUNCH would remap hv.sys pages and the guest would crash immediately.
-  if (!cpu->ept_hide_applied && ghv.hide_pending &&
+  if (!cpu->ept_hide_applied && !ghv.stop_requested && ghv.hide_pending &&
       ghv.hv_image_pfns && ghv.hv_image_pfn_count) {
     __try {
       hide_pfns_in_ept(cpu->ept, ghv.hv_image_pfns, ghv.hv_image_pfn_count);
@@ -294,6 +294,16 @@ bool handle_vm_exit(guest_context* const ctx) {
     bool has_pending = false;
     auto const processed = process_shared_queue(cpu, &has_pending);
 
+    // A shared-queue command may have requested global devirtualization.
+    // Re-check here so the current CPU can exit on the SAME VM-exit without waiting for another one.
+    if (ghv.stop_requested) {
+      cpu->stop_virtualization = true;
+      if (!cpu->stop_notified) {
+        cpu->stop_notified = true;
+        InterlockedIncrement(const_cast<LONG*>(&ghv.stopped_cpu_count));
+      }
+    }
+
     // 简单自适应：有负载/待处理 -> 短周期；空闲 -> 长周期
     uint32_t short_ticks = 10000u >> cpu->cached.vmx_misc.preemption_timer_tsc_relationship;
     if (short_ticks < 2)
@@ -321,6 +331,14 @@ bool handle_vm_exit(guest_context* const ctx) {
   // RIP, CS, RFLAGS, RSP, SS, CR0, CR4, as well as the usual fields in
   // the guest_context structure. the C++ code is responsible for the rest.
   if (cpu->stop_virtualization) {
+    // If we hid hv.sys pages, we MUST unhide before returning to the guest.
+    // Driver unload runs in the guest and expects hv.sys code/data to be readable/executable.
+    if (cpu->ept_hide_applied && ghv.hv_image_pfns && ghv.hv_image_pfn_count) {
+      unhide_pfns_in_ept(cpu->ept, ghv.hv_image_pfns, ghv.hv_image_pfn_count);
+      cpu->ept_hide_applied = false;
+      DbgPrint("[hv] unhide applied for devirtualization.\n");
+    }
+
     // TODO: assert that CPL is 0
 
     // ensure that the control register shadows reflect the guest values
