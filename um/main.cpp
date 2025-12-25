@@ -1,7 +1,11 @@
-#include <iostream>
+#include <algorithm>
 #include <cstdio>
-#include <string>
 #include <cstring>
+#include <iostream>
+#include <numeric>
+#include <string>
+#include <vector>
+#include <intrin.h>
 
 #include "hv.h"
 #include "dumper.h"
@@ -11,6 +15,7 @@ static void usage(char const* const exe) {
   printf("  %s --menu         # interactive menu (recommended)\n", exe);
   printf("  %s --devirt-all    # run hypercall_unload on every CPU (useful before unloading hv.sys when EPT self-hide is enabled)\n", exe);
   printf("  %s --demo          # run the shared-queue demo (legacy behavior)\n", exe);
+  printf("  %s --bench-tsc     # benchmark hypercall latency using RDTSC/RDTSCP\n", exe);
   printf("  %s --help\n", exe);
 }
 
@@ -41,6 +46,96 @@ static void action_test() {
     return;
   auto const r = hv::test(1, 2, 3, 4, 5, 6);
   printf("[um] test => 0x%llX\n", r);
+}
+
+struct bench_stats {
+  uint64_t min;
+  uint64_t max;
+  double   avg;
+  uint64_t p50;
+  uint64_t p90;
+  uint64_t p99;
+};
+
+static bench_stats compute_stats(std::vector<uint64_t> const& samples) {
+  bench_stats s{};
+  if (samples.empty())
+    return s;
+
+  auto sorted = samples;
+  std::sort(sorted.begin(), sorted.end());
+
+  auto pct = [&](double p) -> uint64_t {
+    auto const idx = static_cast<size_t>(p * (sorted.size() - 1));
+    return sorted[idx];
+  };
+
+  long double sum = 0.0L;
+  for (auto v : samples)
+    sum += static_cast<long double>(v);
+
+  s.min = sorted.front();
+  s.max = sorted.back();
+  s.avg = static_cast<double>(sum) / static_cast<double>(samples.size());
+  s.p50 = pct(0.50);
+  s.p90 = pct(0.90);
+  s.p99 = pct(0.99);
+  return s;
+}
+
+static uint64_t rdtscp_now() {
+  unsigned int aux = 0;
+  _mm_lfence();
+  auto const t = __rdtscp(&aux);
+  _mm_lfence();
+  return t;
+}
+
+static void action_bench_tsc() {
+  if (!ensure_hv_running())
+    return;
+
+  constexpr int warmup = 200;
+  constexpr int iters  = 5000;
+
+  // Pin to CPU0 to reduce jitter (scheduler migration hurts timing).
+  auto const thread = GetCurrentThread();
+  auto const prev_affinity = SetThreadAffinityMask(thread, 1ull);
+
+  hv::queue_handshake_request req{};
+  req.queue = nullptr;
+  req.size  = 0;
+  req.magic = 0x1122334455667788ull;
+  req.seed  = 0x8877665544332211ull;
+
+  // Warm-up to stabilize caches/TLBs.
+  for (int i = 0; i < warmup; ++i) {
+    (void)hv::queue_handshake(req);
+  }
+
+  std::vector<uint64_t> samples;
+  samples.reserve(iters);
+
+  for (int i = 0; i < iters; ++i) {
+    auto const t0 = rdtscp_now();
+    (void)hv::queue_handshake(req);
+    auto const t1 = rdtscp_now();
+    samples.push_back(t1 - t0);
+  }
+
+  if (prev_affinity)
+    SetThreadAffinityMask(thread, prev_affinity);
+
+  auto const stats = compute_stats(samples);
+  printf("[um][bench] cpuid-handshake latency (cycles):\n");
+  printf("  n=%zu min=%llu max=%llu avg=%.2f p50=%llu p90=%llu p99=%llu\n",
+    samples.size(),
+    static_cast<unsigned long long>(stats.min),
+    static_cast<unsigned long long>(stats.max),
+    stats.avg,
+    static_cast<unsigned long long>(stats.p50),
+    static_cast<unsigned long long>(stats.p90),
+    static_cast<unsigned long long>(stats.p99));
 }
 
 static void action_devirt_all() {
@@ -357,6 +452,7 @@ static void run_menu() {
     printf("2) test (example hypercall)\n");
     printf("3) shared-queue demo\n");
     printf("4) devirt-all (run hypercall_unload on each CPU; use before unloading hv.sys when self-hide is enabled)\n");
+    printf("5) bench-tsc (measure hypercall latency via RDTSC/RDTSCP)\n");
     printf("0) exit\n");
     printf("Select: ");
     fflush(stdout);
@@ -391,6 +487,10 @@ static void run_menu() {
       action_devirt_all();
       wait_enter();
       break;
+    case 5:
+      action_bench_tsc();
+      wait_enter();
+      break;
     case 0:
       return;
     default:
@@ -408,6 +508,11 @@ int main(int argc, char** argv) {
 
   if (argc >= 2 && strcmp(argv[1], "--devirt-all") == 0) {
     action_devirt_all();
+    return 0;
+  }
+
+  if (argc >= 2 && strcmp(argv[1], "--bench-tsc") == 0) {
+    action_bench_tsc();
     return 0;
   }
 

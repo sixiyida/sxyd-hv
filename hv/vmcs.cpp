@@ -29,6 +29,14 @@ void write_vmcs_ctrl_fields(vcpu* const cpu) {
   // can destabilize the system if the handler isn't perfect. Keep it disabled by default.
   proc_based_ctrl.cr3_load_exiting            = 0;
   //proc_based_ctrl.cr3_store_exiting           = 0;
+  // Do NOT VM-exit on RDTSC/RDTSCP by default:
+  // it's extremely hot on Windows and will cause severe slowdowns (especially under nested virtualization).
+  // If you really want it for experiments, compile with HV_RDTSC_EXITING.
+#if defined(HV_RDTSC_EXITING)
+  proc_based_ctrl.rdtsc_exiting               = 1;
+#else
+  proc_based_ctrl.rdtsc_exiting               = 0;
+#endif
   proc_based_ctrl.use_msr_bitmaps             = 1;
   proc_based_ctrl.use_tsc_offsetting          = 1;
   proc_based_ctrl.activate_secondary_controls = 1;

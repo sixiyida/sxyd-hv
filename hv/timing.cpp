@@ -7,6 +7,16 @@
 
 namespace hv {
 
+// Scale factor for TSC compensation to reduce the chance of guest-visible TSC going backwards.
+// Default: 1/2 (50%). You can override at build time with HV_TSC_COMP_NUM / HV_TSC_COMP_DEN.
+#if !defined(HV_TSC_COMP_NUM)
+#define HV_TSC_COMP_NUM 3
+#endif
+#if !defined(HV_TSC_COMP_DEN)
+#define HV_TSC_COMP_DEN 5
+#endif
+static_assert(HV_TSC_COMP_DEN != 0, "HV_TSC_COMP_DEN must be non-zero");
+
 // try to hide the vm-exit overhead from being detected through timings
 void hide_vm_exit_overhead(vcpu* const cpu) {
   //
@@ -44,34 +54,54 @@ void hide_vm_exit_overhead(vcpu* const cpu) {
   
   // this usually occurs for vm-exits that are unlikely to be reliably timed,
   // such as when an exception occurs or if the preemption timer fired
-  if (!cpu->hide_vm_exit_overhead || cpu->vm_exit_tsc_overhead > 10000) {
-    // this is our chance to resync the TSC
+  if (!cpu->hide_vm_exit_overhead) {
+    // resync TSC offset when we are not trying to hide
     cpu->tsc_offset = 0;
-
-    // soft disable the VMX preemption timer
-    cpu->preemption_timer = ~0ull;
-
+    cpu->last_guest_tsc = __rdtsc();
     return;
   }
 
-  // set the preemption timer to cause an exit after 10000 guest TSC ticks have passed
-  cpu->preemption_timer = max(2,
-    10000 >> cpu->cached.vmx_misc.preemption_timer_tsc_relationship);
+  // Allow larger overheads (e.g., nested virtualization) before forcing resync.
+  // Previously 10k; raise to tolerate high VM-exit cost in nested setups.
+  if (cpu->vm_exit_tsc_overhead > 10000) {
+    // very large overhead, force a resync
+    cpu->tsc_offset = 0;
+    cpu->cumulative_tsc_exit_overhead = 0;
+    return;
+  }
 
   // use TSC offsetting to hide from timing attacks that use the TSC
-  cpu->tsc_offset -= cpu->vm_exit_tsc_overhead;
+  auto const scaled_overhead =
+    (cpu->vm_exit_tsc_overhead * static_cast<uint64_t>(HV_TSC_COMP_NUM))
+    / static_cast<uint64_t>(HV_TSC_COMP_DEN);
+  // Lightweight monotonic protection:
+  // Changing TSC offset can make guest-visible time go backwards and eventually destabilize Windows timekeeping.
+  // We clamp the adjustment so that "guest_now" (at this moment) never goes below last_guest_tsc.
+  auto const host_now = __rdtsc();
+  auto const guest_now = host_now + cpu->tsc_offset;
+
+  uint64_t applied = scaled_overhead;
+  if (applied) {
+    if (guest_now <= cpu->last_guest_tsc) {
+      applied = 0;
+    } else if (guest_now - applied < cpu->last_guest_tsc) {
+      applied = guest_now - cpu->last_guest_tsc;
+    }
+  }
+
+  cpu->tsc_offset -= applied;
+  cpu->last_guest_tsc = guest_now - applied;
+
+  // offsetting already accounted for this vm-exit; avoid double-compensating later
+  if (cpu->cumulative_tsc_exit_overhead >= applied)
+    cpu->cumulative_tsc_exit_overhead -= applied;
+  else
+    cpu->cumulative_tsc_exit_overhead = 0;
 }
 
 // measure the overhead of a vm-exit (RDTSC)
 uint64_t measure_vm_exit_tsc_overhead() {
-#if defined(HV_NO_VMCALL)
-  return 0;
-#endif
   _disable();
-
-  hypercall_input hv_input;
-  hv_input.code = hypercall_ping;
-  hv_input.key  = hypercall_key;
 
   uint64_t lowest_vm_exit_overhead = ~0ull;
   uint64_t lowest_timing_overhead  = ~0ull;
@@ -88,13 +118,14 @@ uint64_t measure_vm_exit_tsc_overhead() {
 
     auto const timing_overhead = (end - start);
 
-    vmx_vmcall(hv_input);
-
     _mm_lfence();
     start = __rdtsc();
     _mm_lfence();
 
-    vmx_vmcall(hv_input);
+    // trigger a reliable VM-exit in builds where VMCALL is disabled
+    // (CPUID is always intercepted and emulated).
+    int regs[4] = {};
+    __cpuidex(regs, 0, 0);
 
     _mm_lfence();
     end = __rdtsc();

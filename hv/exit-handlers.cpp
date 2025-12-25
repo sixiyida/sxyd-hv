@@ -10,6 +10,19 @@
 
 namespace hv {
 
+// Return the guest-visible TSC after applying the current VMCS offset and
+// removing the accumulated vm-exit overhead.
+static uint64_t compute_guest_tsc(vcpu* const cpu, uint64_t const host_tsc) {
+  auto adjusted = host_tsc + cpu->tsc_offset;
+
+  if (adjusted > cpu->cumulative_tsc_exit_overhead)
+    adjusted -= cpu->cumulative_tsc_exit_overhead;
+  else
+    adjusted = 0;
+
+  return adjusted;
+}
+
 void emulate_cpuid(vcpu* const cpu) {
   auto const ctx = cpu->ctx;
 
@@ -647,24 +660,30 @@ void handle_ept_violation(vcpu* const cpu) {
 }
 
 void emulate_rdtsc(vcpu* const cpu) {
-  auto const tsc = __rdtsc();
+  auto const tsc = compute_guest_tsc(cpu, __rdtsc());
 
   // return current TSC
   cpu->ctx->rax = tsc & 0xFFFFFFFF;
   cpu->ctx->rdx = (tsc >> 32) & 0xFFFFFFFF;
 
+  // enable vm-exit overhead hiding for this exit
+  if (cpu->vm_exit_tsc_overhead)
+    cpu->hide_vm_exit_overhead = true;
   skip_instruction();
 }
 
 void emulate_rdtscp(vcpu* const cpu) {
   unsigned int aux = 0;
-  auto const tsc = __rdtscp(&aux);
+  auto const tsc = compute_guest_tsc(cpu, __rdtscp(&aux));
 
   // return current TSC
   cpu->ctx->rax = tsc & 0xFFFFFFFF;
   cpu->ctx->rdx = (tsc >> 32) & 0xFFFFFFFF;
   cpu->ctx->rcx = aux;
 
+  // enable vm-exit overhead hiding for this exit
+  if (cpu->vm_exit_tsc_overhead)
+    cpu->hide_vm_exit_overhead = true;
   skip_instruction();
 }
 

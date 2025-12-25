@@ -273,6 +273,10 @@ bool handle_vm_exit(guest_context* const ctx) {
   vmx_vmexit_reason reason;
   reason.flags = static_cast<uint32_t>(vmx_vmread(VMCS_EXIT_REASON));
 
+  // track vm-exit statistics for TSC compensation
+  ++cpu->vm_exit_count;
+  cpu->cumulative_tsc_exit_overhead += cpu->vm_exit_tsc_overhead;
+
   // dont hide tsc overhead by default
   cpu->hide_vm_exit_overhead = false;
   cpu->stop_virtualization   = false;
@@ -313,7 +317,7 @@ bool handle_vm_exit(guest_context* const ctx) {
       long_ticks = 0xFFFFFFFFu;
 
     uint32_t next = (processed > 0 || has_pending) ? short_ticks : long_ticks;
-    vmx_vmwrite(VMCS_GUEST_VMX_PREEMPTION_TIMER_VALUE, next);
+    cpu->preemption_timer = next;
 
     vmentry_interrupt_information interrupt_info;
     interrupt_info.flags = static_cast<uint32_t>(
@@ -502,6 +506,9 @@ bool virtualize_cpu(vcpu* const cpu) {
   cpu->vm_exit_tsc_overhead      = 0;
   cpu->vm_exit_mperf_overhead    = 0;
   cpu->vm_exit_ref_tsc_overhead  = 0;
+  cpu->vm_exit_count             = 0;
+  cpu->cumulative_tsc_exit_overhead = 0;
+  cpu->last_guest_tsc            = 0;
   cpu->stop_notified             = false;
 
   DbgPrint("Launching VM on VCPU#%i...\n", KeGetCurrentProcessorIndex() + 1);

@@ -99,6 +99,11 @@ struct vcpu {
   uint64_t vm_exit_mperf_overhead;
   uint64_t vm_exit_ref_tsc_overhead;
 
+  // accumulated vm-exit counts/overhead for TSC compensation
+  uint64_t vm_exit_count;
+  uint64_t cumulative_tsc_exit_overhead;
+  uint64_t last_guest_tsc;
+
   // whether to use TSC offsetting for the current vm-exit--false by default
   bool hide_vm_exit_overhead;
 
