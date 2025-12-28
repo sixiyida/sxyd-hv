@@ -184,6 +184,11 @@ extern g_hv_vmxoff_cpu_count : dword
   vmresume
 
 stop_virtualization:
+  ; We are about to tear down VMX and switch execution context back to the guest.
+  ; Avoid taking maskable interrupts in the middle of stack/segment transitions.
+  ; iretq will restore IF from the guest RFLAGS we load.
+  cli
+
   ; we'll be dirtying these registers in order to setup the
   ; stack so we need to store and restore them before we can use them.
   ; also note that we're not allocating any stack space for the trap
@@ -197,6 +202,7 @@ stop_virtualization:
   ; push SS
   mov rdx, 0804h; VMCS_GUEST_SS_SELECTOR
   vmread rax, rdx
+  and rax, 0FFFFh
   mov [rbp - 00h], rax
 
   ; push RSP
@@ -207,11 +213,20 @@ stop_virtualization:
   ; push RFLAGS
   mov rdx, 6820h; VMCS_GUEST_RFLAGS
   vmread rax, rdx
+  ; Sanitize RFLAGS for iretq:
+  ; - bits 63:32 are reserved in long mode (must be 0)
+  ; - bit1 must be 1
+  ; - clear NT (bit14) and VM (bit17) to avoid iretq #GP on some setups
+  and rax, 00000000FFFFFFFFh
+  or  rax, 2
+  and rax, 0FFFFFFFFFFFBFFFFh ; clear NT (bit14)
+  and rax, 0FFFFFFFFFFFDFFFFh ; clear VM (bit17)
   mov [rbp - 10h], rax
 
   ; push CS
   mov rdx, 0802h; VMCS_GUEST_CS_SELECTOR
   vmread rax, rdx
+  and rax, 0FFFFh
   mov [rbp - 18h], rax
 
   ; push RIP
@@ -243,6 +258,46 @@ stop_virtualization:
   mov cr0, rax
   mov cr4, rdx
 
+  ; IMPORTANT:
+  ; iretq only pops RSP/SS if returning to a different privilege level.
+  ; When the guest is in CPL0, iretq would NOT restore the guest RSP/SS,
+  ; leaving us on the HV stack and typically causing a fast crash / double fault.
+  ;
+  ; Detect CPL via guest CS selector RPL (bits 1:0):
+  ; - CPL0 (RPL=0): switch to guest RSP manually and push (RFLAGS, CS, RIP)
+  ; - CPL3 (RPL=3): keep original frame on HV stack and iretq will pop 5 items.
+  mov rax, [rbp - 18h]        ; guest CS selector
+  test al, 3
+  jnz return_cpl3
+
+return_cpl0:
+  ; Switch to guest kernel stack and build a 3-qword iret frame on it
+  ; without touching user memory.
+  ;
+  ; NOTE: In VMX root-mode our host SS selector is configured as 0.
+  ; For CPL0 return, iretq will NOT pop a new SS, and stack operations
+  ; (including these pushes and the iretq pops) still use SS. A null/unusable
+  ; SS will cause a #GP here. Load the guest SS selector explicitly first.
+  mov ax, word ptr [rbp - 00h] ; guest SS selector (low 16 bits)
+  mov ss, ax
+
+  mov rsp, [rbp - 08h]        ; guest RSP
+  push qword ptr [rbp - 10h]  ; guest RFLAGS
+  push qword ptr [rbp - 18h]  ; guest CS
+  push qword ptr [rbp - 20h]  ; guest RIP
+
+  ; Restore the registers we dirtied in this block from the saved copies.
+  ; Saved layout relative to our frame pointer:
+  ;   [rbp-38h] = saved guest RBP
+  ;   [rbp-30h] = saved guest RDX
+  ;   [rbp-28h] = saved guest RAX
+  mov rax, [rbp - 28h]
+  mov rdx, [rbp - 30h]
+  mov rbp, [rbp - 38h]
+
+  iretq
+
+return_cpl3:
   ; restore the dirty registers
   pop rbp
   pop rdx

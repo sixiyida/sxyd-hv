@@ -195,10 +195,52 @@ static void action_devirt_all() {
   qhdr->head = 1;
   _mm_mfence();
 
-  // Kick HV: repeat handshake to force a VM-exit, then it will process the queue.
-  auto const ks = hv::queue_handshake(req);
-  printf("[um] kick result: signature=0x%llX status=%u pages=%u magic_echo=0x%llX\n",
-    ks.signature, static_cast<uint32_t>(ks.status), ks.page_count, ks.echoed_magic);
+  // Kick all CPUs to force immediate VM-exits and complete devirtualization deterministically.
+  // Rationale:
+  // - devirt_all sets a global stop flag in the HV (root-mode).
+  // - each logical processor devirtualizes on its NEXT VM-exit.
+  // - on multi-core (and especially in idle), waiting for timers can race with driver unload.
+  printf("[um] Forcing a VM-exit on each CPU (CPUID) to complete devirtualization...\n");
+  fflush(stdout);
+
+  // Kick current CPU first to ensure the queue is processed and stop is requested.
+  {
+    auto const ks = hv::queue_handshake(req);
+    printf("[um] kick result: signature=0x%llX status=%u pages=%u magic_echo=0x%llX\n",
+      ks.signature, static_cast<uint32_t>(ks.status), ks.page_count, ks.echoed_magic);
+    fflush(stdout);
+  }
+
+  // Then force at least one VM-exit on every CPU.
+  hv::for_each_cpu([&](uint32_t cpu_idx) {
+    int regs[4] = {};
+    __cpuid(regs, 0);
+    printf("[um] cpu%u cpuid-kick done.\n", cpu_idx);
+    fflush(stdout);
+  });
+
+  // Verify devirtualization: once a CPU VMXOFF'd, the CPUID handshake won't be intercepted
+  // and hv::is_hv_running() (pinned to that CPU) should return false.
+  SYSTEM_INFO info{};
+  GetSystemInfo(&info);
+  constexpr DWORD timeout_ms = 5000;
+  DWORD waited = 0;
+  while (waited < timeout_ms) {
+    uint32_t done = 0;
+    hv::for_each_cpu([&](uint32_t /*cpu_idx*/) {
+      if (!hv::is_hv_running())
+        ++done;
+    });
+    if (done >= info.dwNumberOfProcessors) {
+      printf("[um] Devirtualization complete on all CPUs (%u/%u).\n",
+        done, info.dwNumberOfProcessors);
+      fflush(stdout);
+      break;
+    }
+
+    Sleep(50);
+    waited += 50;
+  }
 
   printf("[um] Requested. Now stop/unload hv.sys via SCM. Keep this program running until done.\n");
   wait_enter();

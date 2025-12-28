@@ -283,10 +283,20 @@ bool handle_vm_exit(guest_context* const ctx) {
 
   // devirtualize request (no VMCALL path)
   if (ghv.stop_requested) {
-    cpu->stop_virtualization = true;
-    if (!cpu->stop_notified) {
-      cpu->stop_notified = true;
-      InterlockedIncrement(const_cast<LONG*>(&ghv.stopped_cpu_count));
+    // IMPORTANT:
+    // Devirtualizing from CPL0 (idle/interrupt context) is fragile and can crash if the
+    // return frame/segments aren't perfectly restored. To make devirt deterministic and
+    // safe on multi-core, only execute VMXOFF when the guest is in CPL3 (user-mode).
+    //
+    // UM devirt-all pins a user thread to each CPU and executes CPUID, guaranteeing a
+    // CPL3 VM-exit for every logical processor.
+    auto const guest_cs = vmx_vmread(VMCS_GUEST_CS_SELECTOR);
+    if ((guest_cs & 3ull) == 3ull) {
+      cpu->stop_virtualization = true;
+      if (!cpu->stop_notified) {
+        cpu->stop_notified = true;
+        InterlockedIncrement(const_cast<LONG*>(&ghv.stopped_cpu_count));
+      }
     }
   }
 
@@ -301,10 +311,13 @@ bool handle_vm_exit(guest_context* const ctx) {
     // A shared-queue command may have requested global devirtualization.
     // Re-check here so the current CPU can exit on the SAME VM-exit without waiting for another one.
     if (ghv.stop_requested) {
-      cpu->stop_virtualization = true;
-      if (!cpu->stop_notified) {
-        cpu->stop_notified = true;
-        InterlockedIncrement(const_cast<LONG*>(&ghv.stopped_cpu_count));
+      auto const guest_cs = vmx_vmread(VMCS_GUEST_CS_SELECTOR);
+      if ((guest_cs & 3ull) == 3ull) {
+        cpu->stop_virtualization = true;
+        if (!cpu->stop_notified) {
+          cpu->stop_notified = true;
+          InterlockedIncrement(const_cast<LONG*>(&ghv.stopped_cpu_count));
+        }
       }
     }
 
@@ -361,7 +374,13 @@ bool handle_vm_exit(guest_context* const ctx) {
     __writemsr(IA32_PERF_GLOBAL_CTRL, cpu->msr_exit_store.perf_global_ctrl.msr_data);
 
     // CR3
-    __writecr3(vmx_vmread(VMCS_GUEST_CR3));
+    // IMPORTANT (KPTI):
+    // VMCS_GUEST_CR3 may be the *user* page table when the VM-exit happened in CPL3.
+    // If we switch to that CR3 while still executing hv.sys code on our custom host stack,
+    // the stack/code may not be mapped and we can crash with BAD_STACK_POINTER / 0x7F (double fault).
+    //
+    // Use the guest *kernel* DirectoryTableBase instead (works even when KPTI is enabled).
+    __writecr3(current_guest_cr3().flags);
 
     // GDT
     segment_descriptor_register_64 gdtr;
