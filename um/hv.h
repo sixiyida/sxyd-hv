@@ -66,6 +66,10 @@ enum class shared_queue_cmd : uint32_t {
   query_ept_map,
   // request global devirtualization (used when VMCALL/hypercalls are disabled)
   devirt_all,
+  // fetch recent TSC diagnostic snapshots into a user-provided buffer
+  tsc_diag_dump,
+  // dump aggregated VM-exit/MSR statistics (best-effort)
+  exit_stats_dump,
 };
 
 enum class shared_queue_entry_status : uint32_t {
@@ -94,6 +98,70 @@ struct alignas(64) shared_queue_entry {
   uint64_t reserved;    // 保留
 };
 static_assert(sizeof(shared_queue_entry) == 64, "shared_queue_entry size");
+
+// ========= TSC 诊断（shared-queue 通道） =========
+struct alignas(8) tsc_diag_snapshot {
+  uint64_t seq;
+  uint32_t cpu;
+  uint32_t exit_reason;
+  uint32_t hide_in;
+  uint32_t reserved0;
+
+  uint64_t guest_rip;
+
+  uint64_t host_entry_tsc;
+  uint64_t host_now_tsc;
+  uint64_t elapsed;
+
+  int64_t  tsc_offset_before;
+  int64_t  tsc_offset_after;
+  uint64_t last_guest_tsc;
+
+  uint32_t cpuid_eax;
+  uint32_t cpuid_ecx;
+  uint64_t signature_rax;
+};
+
+struct alignas(8) tsc_diag_dump_header {
+  uint64_t newest_seq;
+  uint32_t count;
+  uint32_t entry_size;
+};
+
+// ========= Exit statistics (shared-queue dump) =========
+inline constexpr uint32_t exit_stats_version = 1;
+inline constexpr uint32_t exit_stats_top_n   = 16;
+
+struct alignas(8) exit_stats_msr_item {
+  uint32_t msr;
+  uint32_t _reserved;
+  uint64_t count;
+};
+
+struct alignas(8) exit_stats_dump {
+  uint32_t version;
+  uint32_t cpu_count;
+
+  // Per-VCPU TSC offset range (signed, cycles).
+  int64_t  tsc_offset_min;
+  int64_t  tsc_offset_max;
+
+  uint64_t exit_total;
+  uint64_t exit_cpuid;
+  uint64_t exit_rdmsr;
+  uint64_t exit_wrmsr;
+  uint64_t exit_exception_or_nmi;
+  uint64_t exit_nmi_window;
+  uint64_t exit_preemption_timer;
+  uint64_t exit_ept_violation;
+  uint64_t exit_mov_cr;
+  uint64_t exit_monitor_trap_flag;
+  uint64_t exit_rdtsc;
+  uint64_t exit_rdtscp;
+
+  exit_stats_msr_item top_rdmsr[exit_stats_top_n];
+  exit_stats_msr_item top_wrmsr[exit_stats_top_n];
+};
 
 inline shared_queue_header* sq_header(void* queue) {
   return reinterpret_cast<shared_queue_header*>(queue);

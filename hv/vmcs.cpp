@@ -209,7 +209,14 @@ void write_vmcs_host_fields(vcpu const* const cpu) {
   // Use Windows TR/GDTR/IDTR to keep handler stubs compatible with selectors.
   vmx_vmwrite(VMCS_HOST_TR_BASE,   segment_base(gdtr, read_tr()));
   vmx_vmwrite(VMCS_HOST_GDTR_BASE, gdtr.base_address);
-  vmx_vmwrite(VMCS_HOST_IDTR_BASE, idtr.base_address);
+  // IMPORTANT:
+  // We must NOT use the original Windows IDT here because VM-exit handling runs on a dedicated
+  // VMM stack (not a legal kernel thread stack). If an exception (#GP from RDMSR, etc) is
+  // delivered to Windows' handlers, the kernel will BugCheck with 0x1AA (invalid stack).
+  //
+  // Instead, point the host IDTR at our per-VCPU IDT table which inherits Windows entries
+  // but overrides key exception vectors to our own stubs.
+  vmx_vmwrite(VMCS_HOST_IDTR_BASE, reinterpret_cast<size_t>(cpu->host_idt));
 
   vmx_vmwrite(VMCS_HOST_SYSENTER_CS,  0);
   vmx_vmwrite(VMCS_HOST_SYSENTER_ESP, 0);

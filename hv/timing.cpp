@@ -3,22 +3,59 @@
 #include "vmx.h"
 #include "logger.h"
 
+#include <stdint.h>
 #include <ntdef.h>
 
 namespace hv {
 
+// Enable/disable TSC compensation globally.
+// If disabled, we keep VMCS TSC offset at 0 to avoid guest time drift/jitter.
+#if !defined(HV_ENABLE_TSC_COMPENSATION)
+#define HV_ENABLE_TSC_COMPENSATION 1
+#endif
+
 // Scale factor for TSC compensation to reduce the chance of guest-visible TSC going backwards.
 // Default: 1/2 (50%). You can override at build time with HV_TSC_COMP_NUM / HV_TSC_COMP_DEN.
 #if !defined(HV_TSC_COMP_NUM)
-#define HV_TSC_COMP_NUM 3
+#define HV_TSC_COMP_NUM 1
 #endif
 #if !defined(HV_TSC_COMP_DEN)
-#define HV_TSC_COMP_DEN 5
+#define HV_TSC_COMP_DEN 2
 #endif
 static_assert(HV_TSC_COMP_DEN != 0, "HV_TSC_COMP_DEN must be non-zero");
 
+// Minimum amount of guest-visible TSC progress (in cycles) to preserve on each VM-exit where
+// compensation is applied. This is a safety valve: stronger compensation lowers measured deltas
+// (e.g. UM bench), but can destabilize timekeeping if it makes time appear to "stall".
+//
+// Recommended for bench tuning: 100..300.
+#if !defined(HV_TSC_MIN_ADVANCE)
+#define HV_TSC_MIN_ADVANCE 200
+#endif
+
+// Legacy behavior: when we decide not to hide the overhead for an exit, reset TSC offset to 0.
+// This can create guest-visible time discontinuities (and large spikes in user-mode benches
+// that measure via RDTSCP). Default: keep the offset to avoid jitter/spikes.
+#if !defined(HV_TSC_RESET_ON_NOHIDE)
+#define HV_TSC_RESET_ON_NOHIDE 1
+#endif
+
+// Clamp how much we are allowed to "eat" per VM-exit (cycles). This prevents sudden large time steps.
+#if !defined(HV_TSC_MAX_EAT_PER_EXIT)
+#define HV_TSC_MAX_EAT_PER_EXIT 50000
+#endif
+
 // try to hide the vm-exit overhead from being detected through timings
-void hide_vm_exit_overhead(vcpu* const cpu) {
+void hide_vm_exit_overhead(vcpu* const cpu, uint64_t const host_entry_tsc) {
+  // Safety switch.
+  // Keeping a non-zero/ever-changing TSC offset can destabilize Windows timekeeping.
+#if !HV_ENABLE_TSC_COMPENSATION
+  UNREFERENCED_PARAMETER(host_entry_tsc);
+  cpu->tsc_offset = 0;
+  cpu->last_guest_tsc = __rdtsc();
+  cpu->hide_vm_exit_overhead = false;
+  return;
+#endif
   //
   // Guest APERF/MPERF values are stored/restored on vm-entry and vm-exit,
   // however, there appears to be a small, yet constant, overhead that occurs
@@ -55,46 +92,51 @@ void hide_vm_exit_overhead(vcpu* const cpu) {
   // this usually occurs for vm-exits that are unlikely to be reliably timed,
   // such as when an exception occurs or if the preemption timer fired
   if (!cpu->hide_vm_exit_overhead) {
-    // resync TSC offset when we are not trying to hide
+    // Not hiding for this exit: keep time stable.
+#if HV_TSC_RESET_ON_NOHIDE
     cpu->tsc_offset = 0;
-    cpu->last_guest_tsc = __rdtsc();
+#endif
+    auto const host_now_s = static_cast<int64_t>(__rdtsc());
+    auto const off_s      = static_cast<int64_t>(cpu->tsc_offset);
+    cpu->last_guest_tsc   = static_cast<uint64_t>(host_now_s + off_s);
     return;
   }
 
-  // Allow larger overheads (e.g., nested virtualization) before forcing resync.
-  // Previously 10k; raise to tolerate high VM-exit cost in nested setups.
-  if (cpu->vm_exit_tsc_overhead > 10000) {
-    // very large overhead, force a resync
-    cpu->tsc_offset = 0;
-    cpu->cumulative_tsc_exit_overhead = 0;
-    return;
+  // Dynamic compensation (conservative):
+  // Eat only a FRACTION of the measured VM-exit wall time, and clamp the adjustment.
+  auto const host_now_s = static_cast<int64_t>(__rdtsc());
+  auto const entry_s    = static_cast<int64_t>(host_entry_tsc);
+  auto const elapsed_s  = host_now_s - entry_s;
+
+  constexpr int64_t min_advance_s = static_cast<int64_t>(HV_TSC_MIN_ADVANCE);
+  int64_t eat_s = 0;
+  if (elapsed_s > min_advance_s)
+    eat_s = elapsed_s - min_advance_s;
+
+  // Scale down to avoid time drift/stutter on multi-core Windows.
+  eat_s = (eat_s * static_cast<int64_t>(HV_TSC_COMP_NUM)) / static_cast<int64_t>(HV_TSC_COMP_DEN);
+
+  if (eat_s < 0)
+    eat_s = 0;
+  if (eat_s > static_cast<int64_t>(HV_TSC_MAX_EAT_PER_EXIT))
+    eat_s = static_cast<int64_t>(HV_TSC_MAX_EAT_PER_EXIT);
+
+  auto new_off_s = static_cast<int64_t>(cpu->tsc_offset) - eat_s;
+  auto guest_now_s = host_now_s + new_off_s;
+
+  // Per-core monotonic clamp (minimum progress).
+  auto const min_allowed_s = static_cast<int64_t>(cpu->last_guest_tsc) + min_advance_s;
+  if (guest_now_s < min_allowed_s) {
+    guest_now_s = min_allowed_s;
+    new_off_s = guest_now_s - host_now_s;
   }
 
-  // use TSC offsetting to hide from timing attacks that use the TSC
-  auto const scaled_overhead =
-    (cpu->vm_exit_tsc_overhead * static_cast<uint64_t>(HV_TSC_COMP_NUM))
-    / static_cast<uint64_t>(HV_TSC_COMP_DEN);
-  // Lightweight monotonic protection:
-  // Changing TSC offset can make guest-visible time go backwards and eventually destabilize Windows timekeeping.
-  // We clamp the adjustment so that "guest_now" (at this moment) never goes below last_guest_tsc.
-  auto const host_now = __rdtsc();
-  auto const guest_now = host_now + cpu->tsc_offset;
+  cpu->tsc_offset = static_cast<uint64_t>(new_off_s);
+  cpu->last_guest_tsc = static_cast<uint64_t>(guest_now_s);
 
-  uint64_t applied = scaled_overhead;
-  if (applied) {
-    if (guest_now <= cpu->last_guest_tsc) {
-      applied = 0;
-    } else if (guest_now - applied < cpu->last_guest_tsc) {
-      applied = guest_now - cpu->last_guest_tsc;
-    }
-  }
-
-  cpu->tsc_offset -= applied;
-  cpu->last_guest_tsc = guest_now - applied;
-
-  // offsetting already accounted for this vm-exit; avoid double-compensating later
-  if (cpu->cumulative_tsc_exit_overhead >= applied)
-    cpu->cumulative_tsc_exit_overhead -= applied;
+  auto const eat_u = static_cast<uint64_t>(eat_s);
+  if (cpu->cumulative_tsc_exit_overhead >= eat_u)
+    cpu->cumulative_tsc_exit_overhead -= eat_u;
   else
     cpu->cumulative_tsc_exit_overhead = 0;
 }

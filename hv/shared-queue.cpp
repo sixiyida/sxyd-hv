@@ -15,7 +15,173 @@ namespace {
 spin_lock g_queue_lock = {};
 shared_queue_context g_queue_entries[shared_queue_max_entries] = {};
 
+#if HV_TSC_DIAG
+// TSC 诊断 ring buffer（只用于调试/定位，不用于功能正确性）
+static volatile LONG64 g_tsc_diag_seq = 0;
+static tsc_diag_snapshot g_tsc_diag_ring[HV_TSC_DIAG_RING_SIZE] = {};
+#endif
+
 } // namespace
+
+#if 1
+static void exit_stats_build_msr_top(
+    exit_stats_msr_item (&out_top)[exit_stats_top_n],
+    bool const is_rdmsr) {
+  // temp hash table to merge counts across CPUs (best-effort)
+  struct alignas(8) tmp_slot {
+    uint32_t msr;
+    uint32_t _reserved;
+    uint64_t count;
+  };
+  constexpr uint32_t tmp_size = 256; // power-of-two
+  constexpr uint32_t tmp_mask = tmp_size - 1;
+  constexpr uint32_t sentinel = diag_msr_sentinel;
+
+  tmp_slot tmp[tmp_size] = {};
+  for (auto& s : tmp) {
+    s.msr = sentinel;
+    s.count = 0;
+  }
+
+  auto tmp_add = [&](uint32_t const msr, uint64_t const add) {
+    if (msr == sentinel || add == 0)
+      return;
+    uint32_t idx = (msr * 2654435761u) & tmp_mask;
+    for (uint32_t probe = 0; probe < tmp_size; ++probe) {
+      auto& slot = tmp[(idx + probe) & tmp_mask];
+      if (slot.msr == msr) {
+        slot.count += add;
+        return;
+      }
+      if (slot.msr == sentinel) {
+        slot.msr = msr;
+        slot.count = add;
+        return;
+      }
+    }
+  };
+
+  // Merge all VCPU tables.
+  if (ghv.vcpus && ghv.vcpu_count) {
+    for (unsigned long i = 0; i < ghv.vcpu_count; ++i) {
+      auto const& cpu = ghv.vcpus[i];
+      auto const* table = is_rdmsr ? cpu.diag_rdmsr_msrs : cpu.diag_wrmsr_msrs;
+      for (uint32_t j = 0; j < diag_msr_table_size; ++j) {
+        auto const msr = table[j].msr;
+        auto const cnt = table[j].count;
+        if (msr == sentinel || cnt == 0)
+          continue;
+        tmp_add(msr, cnt);
+      }
+    }
+  }
+
+  // Extract top-N.
+  for (uint32_t k = 0; k < exit_stats_top_n; ++k) {
+    uint32_t best_idx = 0xFFFFFFFFu;
+    uint64_t best_cnt = 0;
+    for (uint32_t i = 0; i < tmp_size; ++i) {
+      if (tmp[i].msr == sentinel || tmp[i].count == 0)
+        continue;
+      if (tmp[i].count > best_cnt) {
+        best_cnt = tmp[i].count;
+        best_idx = i;
+      }
+    }
+
+    if (best_idx == 0xFFFFFFFFu)
+      break;
+
+    out_top[k].msr = tmp[best_idx].msr;
+    out_top[k].count = tmp[best_idx].count;
+
+    tmp[best_idx].msr = sentinel;
+    tmp[best_idx].count = 0;
+  }
+}
+
+static void exit_stats_build(exit_stats_dump& out) {
+  out = {};
+  out.version = exit_stats_version;
+  out.cpu_count = ghv.vcpu_count;
+  out.tsc_offset_min = 0;
+  out.tsc_offset_max = 0;
+
+  if (ghv.vcpus && ghv.vcpu_count) {
+    bool first = true;
+    for (unsigned long i = 0; i < ghv.vcpu_count; ++i) {
+      auto const& cpu = ghv.vcpus[i];
+      auto const off_s = static_cast<int64_t>(cpu.tsc_offset);
+      if (first) {
+        out.tsc_offset_min = off_s;
+        out.tsc_offset_max = off_s;
+        first = false;
+      } else {
+        if (off_s < out.tsc_offset_min) out.tsc_offset_min = off_s;
+        if (off_s > out.tsc_offset_max) out.tsc_offset_max = off_s;
+      }
+      out.exit_total            += cpu.diag_exit_total;
+      out.exit_cpuid            += cpu.diag_exit_cpuid;
+      out.exit_rdmsr            += cpu.diag_exit_rdmsr;
+      out.exit_wrmsr            += cpu.diag_exit_wrmsr;
+      out.exit_exception_or_nmi += cpu.diag_exit_exception_or_nmi;
+      out.exit_nmi_window       += cpu.diag_exit_nmi_window;
+      out.exit_preemption_timer += cpu.diag_exit_preemption_timer;
+      out.exit_ept_violation    += cpu.diag_exit_ept_violation;
+      out.exit_mov_cr           += cpu.diag_exit_mov_cr;
+      out.exit_monitor_trap_flag+= cpu.diag_exit_monitor_trap_flag;
+      out.exit_rdtsc            += cpu.diag_exit_rdtsc;
+      out.exit_rdtscp           += cpu.diag_exit_rdtscp;
+    }
+  }
+
+  exit_stats_build_msr_top(out.top_rdmsr, true);
+  exit_stats_build_msr_top(out.top_wrmsr, false);
+}
+#endif
+
+#if HV_TSC_DIAG
+void tsc_diag_record(tsc_diag_snapshot const& snap) {
+  auto const seq = static_cast<uint64_t>(InterlockedIncrement64(&g_tsc_diag_seq));
+  auto const idx = static_cast<uint32_t>(seq % static_cast<uint64_t>(HV_TSC_DIAG_RING_SIZE));
+
+  auto s = snap;
+  s.seq = seq;
+  g_tsc_diag_ring[idx] = s;
+}
+
+uint32_t tsc_diag_dump(void* const dst, uint32_t const dst_bytes, uint64_t* const newest_seq_out) {
+  if (!dst || dst_bytes < sizeof(tsc_diag_dump_header))
+    return 0;
+
+  auto const newest = static_cast<uint64_t>(InterlockedCompareExchange64(&g_tsc_diag_seq, 0, 0));
+  if (newest_seq_out)
+    *newest_seq_out = newest;
+
+  auto* const hdr = reinterpret_cast<tsc_diag_dump_header*>(dst);
+  hdr->newest_seq = newest;
+  hdr->entry_size = sizeof(tsc_diag_snapshot);
+
+  auto const max_entries = (dst_bytes - sizeof(tsc_diag_dump_header)) / sizeof(tsc_diag_snapshot);
+  uint32_t const count = (newest < max_entries) ? static_cast<uint32_t>(newest) : static_cast<uint32_t>(max_entries);
+  hdr->count = count;
+
+  auto* const out = reinterpret_cast<tsc_diag_snapshot*>(
+    reinterpret_cast<uint8_t*>(dst) + sizeof(tsc_diag_dump_header));
+
+  // newest-first
+  for (uint32_t i = 0; i < count; ++i) {
+    auto const seq = newest - i;
+    auto const idx = static_cast<uint32_t>(seq % static_cast<uint64_t>(HV_TSC_DIAG_RING_SIZE));
+    out[i] = g_tsc_diag_ring[idx];
+  }
+
+  return count;
+}
+#else
+void tsc_diag_record(tsc_diag_snapshot const&) {}
+uint32_t tsc_diag_dump(void*, uint32_t, uint64_t*) { return 0; }
+#endif
 
 shared_queue_register_result register_shared_queue(
   cr3 const guest_cr3, shared_queue_register_request const& req) {
@@ -387,6 +553,76 @@ uint32_t process_shared_queue(vcpu* const cpu, bool* const has_pending) {
       // Request global devirtualization (no VMCALL path). The current CPU will also
       // re-check stop_requested after queue processing and exit on the same VM-exit.
       request_global_devirtualize();
+      entry->status = static_cast<uint32_t>(shared_queue_entry_status::done);
+    } break;
+
+    case shared_queue_cmd::tsc_diag_dump: {
+      // Copy recent TSC diag snapshots into a user-provided buffer:
+      //   entry->gva  : dst buffer VA (current process)
+      //   entry->size : dst buffer size (recommended <= 0x1000)
+      auto const user_gva = reinterpret_cast<void*>(entry->gva);
+      auto size = entry->size;
+      if (size > 0x1000u)
+        size = 0x1000u;
+
+      size_t dst_remaining = 0;
+      auto* const dst = gva2hva(guest_cr3, user_gva, &dst_remaining);
+      if (!dst || dst_remaining < size) {
+        entry->status = static_cast<uint32_t>(shared_queue_entry_status::err_translate);
+        goto done_entry;
+      }
+
+      uint8_t tmp[0x1000] = {};
+      uint64_t newest = 0;
+      auto const count = tsc_diag_dump(tmp, size, &newest);
+
+      host_exception_info e;
+      memcpy_safe(e, dst, tmp, size);
+      if (e.exception_occurred) {
+        entry->status = static_cast<uint32_t>(shared_queue_entry_status::err_translate);
+        goto done_entry;
+      }
+
+      entry->aux      = count;
+      entry->reserved = newest;
+      entry->size     = size;
+      entry->status   = static_cast<uint32_t>(shared_queue_entry_status::done);
+    } break;
+
+    case shared_queue_cmd::exit_stats_dump: {
+      // Copy aggregated exit stats into a user-provided buffer:
+      //   entry->gva  : dst buffer VA (current process)
+      //   entry->size : dst buffer size (must be >= sizeof(exit_stats_dump), capped at 0x1000)
+      auto const user_gva = reinterpret_cast<void*>(entry->gva);
+      auto size = entry->size;
+      if (size > 0x1000u)
+        size = 0x1000u;
+
+      if (size < sizeof(exit_stats_dump)) {
+        entry->status = static_cast<uint32_t>(shared_queue_entry_status::err_translate);
+        goto done_entry;
+      }
+
+      size_t dst_remaining = 0;
+      auto* const dst = gva2hva(guest_cr3, user_gva, &dst_remaining);
+      if (!dst || dst_remaining < size) {
+        entry->status = static_cast<uint32_t>(shared_queue_entry_status::err_translate);
+        goto done_entry;
+      }
+
+      uint8_t tmp[0x1000] = {};
+      auto* const out = reinterpret_cast<exit_stats_dump*>(tmp);
+      exit_stats_build(*out);
+
+      host_exception_info e;
+      memcpy_safe(e, dst, tmp, size);
+      if (e.exception_occurred) {
+        entry->status = static_cast<uint32_t>(shared_queue_entry_status::err_translate);
+        goto done_entry;
+      }
+
+      entry->aux    = sizeof(exit_stats_dump);
+      entry->size   = size;
       entry->status = static_cast<uint32_t>(shared_queue_entry_status::done);
     } break;
 

@@ -7,7 +7,7 @@ guest_context struct
   $rcx qword ?
   $rdx qword ?
   $rbx qword ?
-  qword ? ; padding
+  $padding qword ? ; padding (used for host metadata: vm-exit entry TSC)
   $rbp qword ?
   $rsi qword ?
   $rdi qword ?
@@ -60,8 +60,15 @@ extern g_hv_vmxoff_cpu_count : dword
 
   ; general-purpose registers
   mov guest_context.$rax[rsp], rax
-  mov guest_context.$rcx[rsp], rcx
   mov guest_context.$rdx[rsp], rdx
+
+  ; capture VM-exit entry TSC as early as possible for dynamic compensation
+  rdtsc
+  shl rdx, 32
+  or  rax, rdx
+  mov guest_context.$padding[rsp], rax
+
+  mov guest_context.$rcx[rsp], rcx
   mov guest_context.$rbx[rsp], rbx
   mov guest_context.$rbp[rsp], rbp
   mov guest_context.$rsi[rsp], rsi
@@ -258,46 +265,7 @@ stop_virtualization:
   mov cr0, rax
   mov cr4, rdx
 
-  ; IMPORTANT:
-  ; iretq only pops RSP/SS if returning to a different privilege level.
-  ; When the guest is in CPL0, iretq would NOT restore the guest RSP/SS,
-  ; leaving us on the HV stack and typically causing a fast crash / double fault.
-  ;
-  ; Detect CPL via guest CS selector RPL (bits 1:0):
-  ; - CPL0 (RPL=0): switch to guest RSP manually and push (RFLAGS, CS, RIP)
-  ; - CPL3 (RPL=3): keep original frame on HV stack and iretq will pop 5 items.
-  mov rax, [rbp - 18h]        ; guest CS selector
-  test al, 3
-  jnz return_cpl3
-
-return_cpl0:
-  ; Switch to guest kernel stack and build a 3-qword iret frame on it
-  ; without touching user memory.
-  ;
-  ; NOTE: In VMX root-mode our host SS selector is configured as 0.
-  ; For CPL0 return, iretq will NOT pop a new SS, and stack operations
-  ; (including these pushes and the iretq pops) still use SS. A null/unusable
-  ; SS will cause a #GP here. Load the guest SS selector explicitly first.
-  mov ax, word ptr [rbp - 00h] ; guest SS selector (low 16 bits)
-  mov ss, ax
-
-  mov rsp, [rbp - 08h]        ; guest RSP
-  push qword ptr [rbp - 10h]  ; guest RFLAGS
-  push qword ptr [rbp - 18h]  ; guest CS
-  push qword ptr [rbp - 20h]  ; guest RIP
-
-  ; Restore the registers we dirtied in this block from the saved copies.
-  ; Saved layout relative to our frame pointer:
-  ;   [rbp-38h] = saved guest RBP
-  ;   [rbp-30h] = saved guest RDX
-  ;   [rbp-28h] = saved guest RAX
-  mov rax, [rbp - 28h]
-  mov rdx, [rbp - 30h]
-  mov rbp, [rbp - 38h]
-
-  iretq
-
-return_cpl3:
+  ; restore the dirty registers
   ; restore the dirty registers
   pop rbp
   pop rdx

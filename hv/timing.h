@@ -7,7 +7,8 @@ namespace hv {
 struct vcpu;
 
 // try to hide the vm-exit overhead from being detected through timings
-void hide_vm_exit_overhead(vcpu* cpu);
+// host_entry_tsc should be captured as early as possible in the VM-exit handler.
+void hide_vm_exit_overhead(vcpu* cpu, uint64_t host_entry_tsc);
 
 // measure the overhead of a vm-exit (RDTSC)
 uint64_t measure_vm_exit_tsc_overhead();

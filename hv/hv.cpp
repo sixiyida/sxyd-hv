@@ -8,9 +8,9 @@
 
 namespace hv {
 // NOTE: EPT self-hide is experimental and can easily destabilize unload/startup on new kernels.
-// Keep it disabled by default while debugging stability issues.
+// Keep it disabled by default while debugging stability/performance issues.
 #ifndef HV_ENABLE_EPT_SELF_HIDE
-#define HV_ENABLE_EPT_SELF_HIDE 1
+#define HV_ENABLE_EPT_SELF_HIDE 0
 #endif
 // Force a VM-exit on each logical processor by executing CPUID.
 // This is used to make hv::stop() deterministic even when VM-exits are rare.

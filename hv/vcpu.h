@@ -16,6 +16,48 @@ inline constexpr size_t host_stack_size = 0x6000;
 // guest virtual-processor identifier
 inline constexpr uint16_t guest_vpid = 1;
 
+// ====== Diagnostics / lightweight profiling (best-effort) ======
+// We keep these counters per-VCPU (no atomics). Dumps aggregate across all VCPUs.
+inline constexpr uint32_t diag_msr_sentinel = 0xFFFF'FFFFu;
+inline constexpr uint32_t diag_msr_table_size = 64; // must be power-of-two
+
+struct alignas(8) diag_msr_slot {
+  uint32_t msr;
+  uint32_t _reserved;
+  uint64_t count;
+};
+
+static_assert((diag_msr_table_size & (diag_msr_table_size - 1)) == 0,
+  "diag_msr_table_size must be a power-of-two");
+
+inline void diag_msr_table_init(diag_msr_slot (&t)[diag_msr_table_size]) {
+  for (auto& s : t) {
+    s.msr = diag_msr_sentinel;
+    s.count = 0;
+  }
+}
+
+inline void diag_msr_table_record(diag_msr_slot (&t)[diag_msr_table_size], uint32_t const msr) {
+  // Knuth multiplicative hash. Best-effort; collisions are fine for diagnostics.
+  uint32_t const mask = diag_msr_table_size - 1;
+  uint32_t idx = (msr * 2654435761u) & mask;
+
+  for (uint32_t probe = 0; probe < diag_msr_table_size; ++probe) {
+    auto& s = t[(idx + probe) & mask];
+
+    if (s.msr == msr) {
+      ++s.count;
+      return;
+    }
+
+    if (s.msr == diag_msr_sentinel) {
+      s.msr = msr;
+      s.count = 1;
+      return;
+    }
+  }
+}
+
 struct vcpu_cached_data {
   // maximum number of bits in a physical address (MAXPHYSADDR)
   uint64_t max_phys_addr;
@@ -115,6 +157,24 @@ struct vcpu {
 
   // whether EPT self-hide has been applied for this vcpu
   bool ept_hide_applied;
+
+  // ---- diag: VM-exit counters ----
+  uint64_t diag_exit_total;
+  uint64_t diag_exit_cpuid;
+  uint64_t diag_exit_rdmsr;
+  uint64_t diag_exit_wrmsr;
+  uint64_t diag_exit_exception_or_nmi;
+  uint64_t diag_exit_nmi_window;
+  uint64_t diag_exit_preemption_timer;
+  uint64_t diag_exit_ept_violation;
+  uint64_t diag_exit_mov_cr;
+  uint64_t diag_exit_monitor_trap_flag;
+  uint64_t diag_exit_rdtsc;
+  uint64_t diag_exit_rdtscp;
+
+  // ---- diag: top MSRs causing exits (best-effort) ----
+  diag_msr_slot diag_rdmsr_msrs[diag_msr_table_size];
+  diag_msr_slot diag_wrmsr_msrs[diag_msr_table_size];
 };
 
 // virtualize the specified cpu. this assumes that execution is already

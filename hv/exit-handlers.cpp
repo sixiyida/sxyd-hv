@@ -51,6 +51,8 @@ void emulate_cpuid(vcpu* const cpu) {
     ctx->rcx = res.page_count;
     ctx->rdx = req.magic;
 
+    // Only hide timing for OUR own "handshake" CPUID leaf. Hiding timing for every CPUID
+    // (e.g., nohv probes) can destabilize Windows timekeeping via TSC offset drift.
     cpu->hide_vm_exit_overhead = true;
     skip_instruction();
     return;
@@ -68,18 +70,36 @@ void emulate_cpuid(vcpu* const cpu) {
   ctx->rcx = regs[2];
   ctx->rdx = regs[3];
 
-  cpu->hide_vm_exit_overhead = true;
+  // Do NOT hide timing for generic CPUID. It's extremely hot and is commonly used by
+  // anti-VM probes (e.g., nohv). TSC compensation here causes stutter/time drift.
+  cpu->hide_vm_exit_overhead = false;
   skip_instruction();
 }
 
 void emulate_rdmsr(vcpu* const cpu) {
+  // diag: track which MSRs are causing RDMSR VM-exits
+  diag_msr_table_record(cpu->diag_rdmsr_msrs, cpu->ctx->ecx);
+
   if (cpu->ctx->ecx == IA32_FEATURE_CONTROL) {
     // return the fake guest FEATURE_CONTROL MSR
     cpu->ctx->rax = cpu->cached.guest_feature_control.flags & 0xFFFF'FFFF;
     cpu->ctx->rdx = cpu->cached.guest_feature_control.flags >> 32;
 
-    cpu->hide_vm_exit_overhead = true;
+    cpu->hide_vm_exit_overhead = false;
     skip_instruction();
+    return;
+  }
+
+  // IMPORTANT:
+  // When "use MSR bitmaps" is enabled, any MSR index outside the bitmap-covered ranges
+  // (0x0000_0000..0x0000_1FFF and 0xC000_0000..0xC000_1FFF) causes an unconditional VM-exit.
+  // Many of those MSRs are undefined on bare metal and would normally raise #GP in the guest.
+  //
+  // Avoid executing host RDMSR on these indices (it can #GP in VMX root-mode). Just reflect
+  // the architectural behavior back into the guest.
+  auto const msr = cpu->ctx->ecx;
+  if (!(msr <= 0x1FFFu || (msr >= 0xC0000000u && msr <= 0xC0001FFFu))) {
+    inject_hw_exception(general_protection, 0);
     return;
   }
 
@@ -87,7 +107,7 @@ void emulate_rdmsr(vcpu* const cpu) {
 
   // the guest could be reading from MSRs that are outside of the MSR bitmap
   // range. refer to https://www.unknowncheats.me/forum/3425463-post15.html
-  auto const msr_value = rdmsr_safe(e, cpu->ctx->ecx);
+  auto const msr_value = rdmsr_safe(e, msr);
 
   if (e.exception_occurred) {
     // reflect the exception back into the guest
@@ -98,13 +118,16 @@ void emulate_rdmsr(vcpu* const cpu) {
   cpu->ctx->rax = msr_value & 0xFFFF'FFFF;
   cpu->ctx->rdx = msr_value >> 32;
 
-  cpu->hide_vm_exit_overhead = true;
+  cpu->hide_vm_exit_overhead = false;
   skip_instruction();
 }
 
 void emulate_wrmsr(vcpu* const cpu) {
   auto const msr = cpu->ctx->ecx;
   auto const value = (cpu->ctx->rdx << 32) | cpu->ctx->eax;
+
+  // diag: track which MSRs are causing WRMSR VM-exits
+  diag_msr_table_record(cpu->diag_wrmsr_msrs, msr);
 
   // let the guest write to the MSRs
   host_exception_info e;
@@ -128,7 +151,7 @@ void emulate_wrmsr(vcpu* const cpu) {
     vmx_invept(invept_all_context, {});
   }
 
-  cpu->hide_vm_exit_overhead = true;
+  cpu->hide_vm_exit_overhead = false;
   skip_instruction();
   return;
 }
@@ -210,7 +233,7 @@ void emulate_xsetbv(vcpu* const cpu) {
 
   HV_LOG_VERBOSE("Wrote %p to XCR0.", new_xcr0.flags);
 
-  cpu->hide_vm_exit_overhead = true;
+  cpu->hide_vm_exit_overhead = false;
   skip_instruction();
 }
 

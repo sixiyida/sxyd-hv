@@ -75,7 +75,7 @@ ehandler:
 
   ; return value
   shl rdx, 32
-  and rax, rdx
+  or  rax, rdx
 
 ehandler:
   ret

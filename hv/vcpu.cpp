@@ -242,6 +242,8 @@ bool handle_vm_exit(guest_context* const ctx) {
   // get the current vcpu
   auto const cpu = reinterpret_cast<vcpu*>(_readfsbase_u64());
   cpu->ctx = ctx;
+  // Captured in vm-exit.asm (as early as possible) to include the full exit prologue cost.
+  auto const host_entry_tsc = ctx->_padding;
 
   // Apply EPT self-hide lazily, only after startup completed.
   // Important: doing this before VMLAUNCH would remap hv.sys pages and the guest would crash immediately.
@@ -272,6 +274,23 @@ bool handle_vm_exit(guest_context* const ctx) {
 
   vmx_vmexit_reason reason;
   reason.flags = static_cast<uint32_t>(vmx_vmread(VMCS_EXIT_REASON));
+
+  // ---- diag: track VM-exit reasons (best-effort; per-VCPU counters) ----
+  ++cpu->diag_exit_total;
+  switch (reason.basic_exit_reason) {
+  case VMX_EXIT_REASON_EXCEPTION_OR_NMI:             ++cpu->diag_exit_exception_or_nmi; break;
+  case VMX_EXIT_REASON_NMI_WINDOW:                   ++cpu->diag_exit_nmi_window;       break;
+  case VMX_EXIT_REASON_EXECUTE_CPUID:                ++cpu->diag_exit_cpuid;            break;
+  case VMX_EXIT_REASON_MOV_CR:                       ++cpu->diag_exit_mov_cr;           break;
+  case VMX_EXIT_REASON_EXECUTE_RDMSR:                ++cpu->diag_exit_rdmsr;            break;
+  case VMX_EXIT_REASON_EXECUTE_WRMSR:                ++cpu->diag_exit_wrmsr;            break;
+  case VMX_EXIT_REASON_EPT_VIOLATION:                ++cpu->diag_exit_ept_violation;    break;
+  case VMX_EXIT_REASON_EXECUTE_RDTSC:                ++cpu->diag_exit_rdtsc;            break;
+  case VMX_EXIT_REASON_EXECUTE_RDTSCP:               ++cpu->diag_exit_rdtscp;           break;
+  case VMX_EXIT_REASON_MONITOR_TRAP_FLAG:            ++cpu->diag_exit_monitor_trap_flag;break;
+  case VMX_EXIT_REASON_VMX_PREEMPTION_TIMER_EXPIRED: ++cpu->diag_exit_preemption_timer;break;
+  default: break;
+  }
 
   // track vm-exit statistics for TSC compensation
   ++cpu->vm_exit_count;
@@ -321,16 +340,35 @@ bool handle_vm_exit(guest_context* const ctx) {
       }
     }
 
-    // 简单自适应：有负载/待处理 -> 短周期；空闲 -> 长周期
-    uint32_t short_ticks = 10000u >> cpu->cached.vmx_misc.preemption_timer_tsc_relationship;
-    if (short_ticks < 2)
-      short_ticks = 2;
-    uint32_t long_ticks = short_ticks * 1024;
-    if (long_ticks < short_ticks) // 溢出保护
-      long_ticks = 0xFFFFFFFFu;
+    // IMPORTANT (performance):
+    // VMX preemption timer exits are enabled globally. Once we start programming a finite timer
+    // value, the CPU will keep generating periodic VM-exits even if the guest stops doing anything.
+    //
+    // That perfectly matches the symptom "load nohv => stutter, unload nohv => stutter persists until devirt":
+    // nohv triggers the first VM-exit, then our timer starts firing forever.
+    //
+    // Fix: if the shared-queue is NOT registered for the current guest CR3, keep the timer at max
+    // (effectively disabled). Only run a finite timer when shared-queue polling is actually needed.
+    cr3 guest_cr3;
+    guest_cr3.flags = vmx_vmread(VMCS_GUEST_CR3);
+    shared_queue_context sq{};
+    auto const sq_active = get_shared_queue_context(guest_cr3, &sq);
 
-    uint32_t next = (processed > 0 || has_pending) ? short_ticks : long_ticks;
-    cpu->preemption_timer = next;
+    if (!sq_active) {
+      cpu->preemption_timer = 0xFFFFFFFFu;
+    } else {
+      // 简单自适应：有负载/待处理 -> 短周期；空闲 -> 长周期
+      uint32_t short_ticks = 10000u >> cpu->cached.vmx_misc.preemption_timer_tsc_relationship;
+      if (short_ticks < 2)
+        short_ticks = 2;
+
+      uint32_t long_ticks = short_ticks * 1024;
+      if (long_ticks < short_ticks) // 溢出保护
+        long_ticks = 0xFFFFFFFFu;
+
+      uint32_t next = (processed > 0 || has_pending) ? short_ticks : long_ticks;
+      cpu->preemption_timer = next;
+    }
 
     vmentry_interrupt_information interrupt_info;
     interrupt_info.flags = static_cast<uint32_t>(
@@ -356,7 +394,7 @@ bool handle_vm_exit(guest_context* const ctx) {
       DbgPrint("[hv] unhide applied for devirtualization.\n");
     }
 
-    // TODO: assert that CPL is 0
+    // We only request devirtualization from CPL3 (user-mode) to avoid fragile CPL0 return paths.
 
     // ensure that the control register shadows reflect the guest values
     vmx_vmwrite(VMCS_CTRL_CR0_READ_SHADOW, read_effective_guest_cr0().flags);
@@ -416,7 +454,50 @@ bool handle_vm_exit(guest_context* const ctx) {
     return true;
   }
 
-  hide_vm_exit_overhead(cpu);
+  // Snapshot before compensation (for diagnostics)
+  auto const off_before_s = static_cast<int64_t>(cpu->tsc_offset);
+  auto const hide_in = cpu->hide_vm_exit_overhead ? 1u : 0u;
+
+  hide_vm_exit_overhead(cpu, host_entry_tsc);
+
+#if HV_TSC_DIAG
+  // Only record for the "CPUID handshake" path to keep overhead low.
+  // Rate-limit + always keep spikes.
+  auto const reason_u32 = static_cast<uint32_t>(reason.basic_exit_reason);
+  auto const is_handshake =
+    (reason.basic_exit_reason == VMX_EXIT_REASON_EXECUTE_CPUID) &&
+    (ctx->eax == shared_queue_cpuid_leaf) &&
+    (ctx->ecx == shared_queue_magic0) &&
+    (ctx->rsi == shared_queue_magic1);
+
+  if (is_handshake) {
+    static volatile LONG64 s_diag = 0;
+    auto const n = static_cast<uint64_t>(InterlockedIncrement64(const_cast<volatile LONG64*>(&s_diag)));
+
+    auto const host_now = __rdtsc();
+    auto const elapsed = host_now - host_entry_tsc;
+    auto const do_spike = elapsed >= static_cast<uint64_t>(HV_TSC_DIAG_ELAPSED_THRESH);
+    auto const do_rate  = (HV_TSC_DIAG_RATE != 0u) && ((n % static_cast<uint64_t>(HV_TSC_DIAG_RATE)) == 0ull);
+
+    if (do_spike || do_rate) {
+      tsc_diag_snapshot s{};
+      s.cpu               = KeGetCurrentProcessorIndex();
+      s.exit_reason       = reason_u32;
+      s.hide_in           = hide_in;
+      s.guest_rip         = vmx_vmread(VMCS_GUEST_RIP);
+      s.host_entry_tsc    = host_entry_tsc;
+      s.host_now_tsc      = host_now;
+      s.elapsed           = elapsed;
+      s.tsc_offset_before = off_before_s;
+      s.tsc_offset_after  = static_cast<int64_t>(cpu->tsc_offset);
+      s.last_guest_tsc    = cpu->last_guest_tsc;
+      s.cpuid_eax         = ctx->eax;
+      s.cpuid_ecx         = ctx->ecx;
+      s.signature_rax     = ctx->rax;
+      tsc_diag_record(s);
+    }
+  }
+#endif
 
   // sync the vmcs state with the vcpu state
   vmx_vmwrite(VMCS_CTRL_TSC_OFFSET,                  cpu->tsc_offset);
@@ -529,6 +610,10 @@ bool virtualize_cpu(vcpu* const cpu) {
   cpu->cumulative_tsc_exit_overhead = 0;
   cpu->last_guest_tsc            = 0;
   cpu->stop_notified             = false;
+
+  // init diag MSR tables (memset() leaves msr=0 which is a valid key)
+  diag_msr_table_init(cpu->diag_rdmsr_msrs);
+  diag_msr_table_init(cpu->diag_wrmsr_msrs);
 
   DbgPrint("Launching VM on VCPU#%i...\n", KeGetCurrentProcessorIndex() + 1);
 

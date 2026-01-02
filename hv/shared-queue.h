@@ -2,6 +2,7 @@
 
 #include "mm.h"
 #include "spin-lock.h"
+#include <stdint.h>
 
 namespace hv {
 
@@ -17,6 +18,54 @@ inline constexpr uint32_t shared_queue_cpuid_subleaf_handshake = 0;            /
 inline constexpr uint32_t shared_queue_max_size     = 0x200000; // 2 MiB 防御过大映射
 inline constexpr uint32_t shared_queue_max_pages    = 64;
 inline constexpr uint32_t shared_queue_max_entries  = 64;
+
+// ========= TSC 诊断（通过 shared-queue 拉取，无需 hypercall） =========
+#if !defined(HV_TSC_DIAG)
+#define HV_TSC_DIAG 1
+#endif
+#if !defined(HV_TSC_DIAG_RING_SIZE)
+#define HV_TSC_DIAG_RING_SIZE 1024u
+#endif
+#if !defined(HV_TSC_DIAG_RATE)
+#define HV_TSC_DIAG_RATE 512u
+#endif
+#if !defined(HV_TSC_DIAG_ELAPSED_THRESH)
+#define HV_TSC_DIAG_ELAPSED_THRESH 50000ull
+#endif
+
+struct alignas(8) tsc_diag_snapshot {
+  uint64_t seq;
+  uint32_t cpu;
+  uint32_t exit_reason;
+  uint32_t hide_in;
+  uint32_t reserved0;
+
+  uint64_t guest_rip;
+
+  uint64_t host_entry_tsc;
+  uint64_t host_now_tsc;
+  uint64_t elapsed;
+
+  int64_t  tsc_offset_before;
+  int64_t  tsc_offset_after;
+  uint64_t last_guest_tsc;
+
+  uint32_t cpuid_eax;
+  uint32_t cpuid_ecx;
+  uint64_t signature_rax;
+};
+
+struct alignas(8) tsc_diag_dump_header {
+  uint64_t newest_seq;
+  uint32_t count;
+  uint32_t entry_size;
+};
+
+// 记录一条诊断快照到 ring buffer。
+void tsc_diag_record(tsc_diag_snapshot const& snap);
+
+// 把最近的快照拷到 dst（dst 为 guest 映射缓冲），返回写入条数。
+uint32_t tsc_diag_dump(void* dst, uint32_t dst_bytes, uint64_t* newest_seq_out);
 
 // 握手状态码
 enum class shared_queue_status : uint32_t {
@@ -38,6 +87,45 @@ enum class shared_queue_cmd : uint32_t {
   query_ept_map,
   // request global devirtualization (used when VMCALL/hypercalls are disabled)
   devirt_all,
+  // fetch recent TSC diagnostic snapshots into a user-provided buffer
+  tsc_diag_dump,
+  // dump aggregated VM-exit/MSR statistics (best-effort)
+  exit_stats_dump,
+};
+
+// ========= Exit statistics (shared-queue dump) =========
+inline constexpr uint32_t exit_stats_version = 1;
+inline constexpr uint32_t exit_stats_top_n   = 16;
+
+struct alignas(8) exit_stats_msr_item {
+  uint32_t msr;
+  uint32_t _reserved;
+  uint64_t count;
+};
+
+struct alignas(8) exit_stats_dump {
+  uint32_t version;
+  uint32_t cpu_count;
+
+  // Per-VCPU TSC offset range (signed, cycles). Useful to diagnose time drift/jitter.
+  int64_t  tsc_offset_min;
+  int64_t  tsc_offset_max;
+
+  uint64_t exit_total;
+  uint64_t exit_cpuid;
+  uint64_t exit_rdmsr;
+  uint64_t exit_wrmsr;
+  uint64_t exit_exception_or_nmi;
+  uint64_t exit_nmi_window;
+  uint64_t exit_preemption_timer;
+  uint64_t exit_ept_violation;
+  uint64_t exit_mov_cr;
+  uint64_t exit_monitor_trap_flag;
+  uint64_t exit_rdtsc;
+  uint64_t exit_rdtscp;
+
+  exit_stats_msr_item top_rdmsr[exit_stats_top_n];
+  exit_stats_msr_item top_wrmsr[exit_stats_top_n];
 };
 
 enum class shared_queue_entry_status : uint32_t {
