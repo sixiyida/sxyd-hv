@@ -37,6 +37,12 @@ struct hypervisor {
   // EPT self-hide: enable after startup completes (applied lazily per-vcpu on first VM-exit)
   volatile LONG hide_pending;
 
+  // EPT hide for shared-queue pages (best-effort; see shared-queue.cpp).
+  // When enabled, shared-queue pages are unmapped (remapped to dummy_page) in EPT for
+  // guest contexts that do not own the queue (based on CR3), and temporarily restored
+  // for the owner on VM-exit boundaries (e.g. MOV CR3 / CPUID handshake).
+  volatile LONG sq_hide_enabled;
+
   // pointer to the System process
   uint8_t* system_eprocess;
 

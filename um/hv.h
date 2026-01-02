@@ -64,6 +64,10 @@ enum class shared_queue_cmd : uint32_t {
   write_virt,
   // debug: query EPT mapping for a guest VA (returns PFNs)
   query_ept_map,
+  // debug: query EPT mapping for a guest physical address (returns PFNs)
+  query_ept_gpa,
+  // debug: query whether a PFN is EPT-hooked, and return hook read/exec PFNs
+  query_ept_hook_gpa,
   // request global devirtualization (used when VMCALL/hypercalls are disabled)
   devirt_all,
   // fetch recent TSC diagnostic snapshots into a user-provided buffer

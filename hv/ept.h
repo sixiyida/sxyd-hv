@@ -19,7 +19,11 @@ struct vcpu_ept_hook_node {
 
   // these can be stored as 32-bit integers to conserve space since
   // nobody is going to have more than 16,000 GB of physical memory
-  uint32_t orig_pfn;
+  // PFN used as key to find the hook (the GPA PFN that will trigger EPT violations)
+  uint32_t hooked_pfn;
+  // PFN mapped when handling read/write accesses
+  uint32_t read_pfn;
+  // PFN mapped when handling execute accesses
   uint32_t exec_pfn;
 };
 
@@ -130,6 +134,10 @@ void split_ept_pde(vcpu_ept_data& ept, ept_pde_2mb* pde_2mb);
 // being executed will use the executable page instead
 bool install_ept_hook(vcpu_ept_data& ept,
     uint64_t original_page_pfn, uint64_t executable_page_pfn);
+
+// advanced: hook a PFN but map reads/writes to read_page_pfn and instruction fetches to exec_page_pfn
+bool install_ept_hook_adv(vcpu_ept_data& ept,
+    uint64_t hooked_page_pfn, uint64_t read_page_pfn, uint64_t exec_page_pfn);
 
 // remove an EPT hook that was installed with install_ept_hook()
 void remove_ept_hook(vcpu_ept_data& ept, uint64_t original_page_pfn);

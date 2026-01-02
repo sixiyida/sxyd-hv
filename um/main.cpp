@@ -17,6 +17,7 @@ static void usage(char const* const exe) {
   printf("  %s --demo          # run the shared-queue demo (legacy behavior)\n", exe);
   printf("  %s --bench-tsc     # benchmark hypercall latency using RDTSC/RDTSCP\n", exe);
   printf("  %s --diag-tsc      # dump recent TSC compensation diagnostics via shared-queue (no hypercall)\n", exe);
+  printf("  %s --check-hide    # check whether hv.sys EPT self-hide works, and whether shared-queue pages are hidden from other CR3\n", exe);
   printf("  %s --help\n", exe);
 }
 
@@ -790,6 +791,273 @@ static int action_shared_queue_demo() {
   return 0;
 }
 
+static uint64_t parse_u64(char const* s) {
+  if (!s)
+    return 0;
+  // accepts 123, 0x123
+  return std::strtoull(s, nullptr, 0);
+}
+
+static bool set_affinity_cpu(uint32_t cpu_idx) {
+  if (cpu_idx >= 64) {
+    printf("[um][err] cpu index too large for affinity mask: %u\n", cpu_idx);
+    return false;
+  }
+  auto const mask = 1ull << cpu_idx;
+  auto const prev = SetThreadAffinityMask(GetCurrentThread(), mask);
+  if (!prev) {
+    printf("[um][err] SetThreadAffinityMask failed (gle=0x%08X).\n", GetLastError());
+    return false;
+  }
+  return true;
+}
+
+static bool alloc_and_register_queue(uint8_t*& queue, size_t const queue_size, hv::queue_handshake_request& req) {
+  queue = static_cast<uint8_t*>(
+    VirtualAlloc(nullptr, queue_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+  if (!queue) {
+    printf("[um][err] VirtualAlloc failed (gle=0x%08X).\n", GetLastError());
+    return false;
+  }
+  if (!VirtualLock(queue, queue_size)) {
+    printf("[um][err] VirtualLock failed (gle=0x%08X).\n", GetLastError());
+    VirtualFree(queue, 0, MEM_RELEASE);
+    queue = nullptr;
+    return false;
+  }
+  memset(queue, 0xA5, queue_size);
+
+  req = {};
+  req.queue = queue;
+  req.size  = static_cast<uint32_t>(queue_size);
+  req.magic = 0xC0FFEE123456789ull;
+  req.seed  = 0xBADF00DCAFEBABEull;
+
+  hv::queue_handshake_result hs{};
+  __try {
+    hs = hv::queue_handshake(req);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    printf("[um][err] handshake threw exception: 0x%08X\n", GetExceptionCode());
+    VirtualUnlock(queue, queue_size);
+    VirtualFree(queue, 0, MEM_RELEASE);
+    queue = nullptr;
+    return false;
+  }
+
+  if (hs.signature != hv::hypervisor_signature ||
+      hs.status != hv::queue_register_status::success) {
+    printf("[um][err] handshake failed: signature=%llX status=%u pages=%u\n",
+      hs.signature, static_cast<uint32_t>(hs.status), hs.page_count);
+    VirtualUnlock(queue, queue_size);
+    VirtualFree(queue, 0, MEM_RELEASE);
+    queue = nullptr;
+    return false;
+  }
+
+  return true;
+}
+
+static void deregister_and_free_queue(uint8_t* queue, size_t const queue_size, hv::queue_handshake_request const& req) {
+  if (queue) {
+    hv::queue_handshake_request dereg{};
+    dereg.queue = nullptr;
+    dereg.size  = 0;
+    dereg.magic = req.magic;
+    dereg.seed  = req.seed;
+    __try { (void)hv::queue_handshake(dereg); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    VirtualUnlock(queue, queue_size);
+    VirtualFree(queue, 0, MEM_RELEASE);
+  }
+}
+
+static bool sq_wait_done(hv::shared_queue_header* qhdr, hv::shared_queue_entry* ent, uint32_t idx, uint32_t timeout_ms) {
+  DWORD waited = 0;
+  while (waited < timeout_ms) {
+    if (qhdr->tail > idx &&
+        ent[idx].status == static_cast<uint32_t>(hv::shared_queue_entry_status::done))
+      return true;
+    Sleep(10);
+    waited += 10;
+  }
+  return false;
+}
+
+// Child: run on a specific CPU, register a queue for THIS process, and check whether the given PFN
+// is mapped to the dummy page in the current VCPU's EPT.
+static int action_check_queue_hidden(uint64_t const target_pfn, uint32_t const cpu_idx) {
+  if (!ensure_hv_running())
+    return 1;
+
+  if (!set_affinity_cpu(cpu_idx))
+    return 1;
+
+  constexpr size_t queue_size = 0x2000;
+  uint8_t* queue = nullptr;
+  hv::queue_handshake_request req{};
+  if (!alloc_and_register_queue(queue, queue_size, req))
+    return 1;
+
+  auto* qhdr = hv::sq_header(queue);
+  auto* qent = hv::sq_entries(queue);
+  qhdr->head = 0;
+  qhdr->tail = 0;
+
+  ZeroMemory(&qent[0], sizeof(hv::shared_queue_entry));
+  qent[0].cmd    = static_cast<uint32_t>(hv::shared_queue_cmd::query_ept_gpa);
+  qent[0].status = static_cast<uint32_t>(hv::shared_queue_entry_status::pending);
+  qent[0].gpa    = (target_pfn << 12); // target GPA
+
+  _mm_mfence();
+  qhdr->head = 1;
+  _mm_mfence();
+
+  // Kick to ensure VM-exit
+  __try { (void)hv::queue_handshake(req); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+  if (!sq_wait_done(qhdr, qent, 0, 2000)) {
+    printf("[um][child][err] query_ept_gpa timeout.\n");
+    deregister_and_free_queue(queue, queue_size, req);
+    return 1;
+  }
+
+  auto const orig_pfn   = qent[0].gpa;
+  auto const mapped_pfn = qent[0].aux;
+  auto const dummy_pfn  = qent[0].reserved;
+  bool const hidden = (dummy_pfn != 0 && mapped_pfn == dummy_pfn);
+
+  printf("[um][child] target_pfn=0x%llX => ept_mapped_pfn=0x%llX dummy_pfn=0x%llX => hidden=%s\n",
+    orig_pfn, mapped_pfn, dummy_pfn, hidden ? "true" : "false");
+
+  deregister_and_free_queue(queue, queue_size, req);
+  return hidden ? 0 : 2;
+}
+
+static int action_check_hide() {
+  if (!ensure_hv_running())
+    return 1;
+
+  // Pin to CPU0 so parent/child observe the same VCPU EPT instance.
+  uint32_t cpu_idx = 0;
+  if (!set_affinity_cpu(cpu_idx))
+    return 1;
+
+  constexpr size_t queue_size = 0x2000;
+  uint8_t* queue = nullptr;
+  hv::queue_handshake_request req{};
+  if (!alloc_and_register_queue(queue, queue_size, req))
+    return 1;
+
+  auto* qhdr = hv::sq_header(queue);
+  auto* qent = hv::sq_entries(queue);
+  qhdr->head = 0;
+  qhdr->tail = 0;
+
+  // 1) hv.sys self-hide check (same as demo)
+  void* hv_base = nullptr;
+  uint32_t hv_size = 0;
+  if (find_loaded_driver("hv.sys", hv_base, hv_size)) {
+    ZeroMemory(&qent[0], sizeof(hv::shared_queue_entry));
+    qent[0].cmd    = static_cast<uint32_t>(hv::shared_queue_cmd::query_ept_map);
+    qent[0].status = static_cast<uint32_t>(hv::shared_queue_entry_status::pending);
+    qent[0].cr3    = 0;
+    qent[0].gva    = reinterpret_cast<uint64_t>(hv_base);
+
+    _mm_mfence();
+    qhdr->head = 1;
+    _mm_mfence();
+    __try { (void)hv::queue_handshake(req); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+    if (sq_wait_done(qhdr, qent, 0, 2000)) {
+      auto const orig_pfn   = qent[0].gpa;
+      auto const mapped_pfn = qent[0].aux;
+      auto const dummy_pfn  = qent[0].reserved;
+
+      // IMPORTANT:
+      // In "read-hide/exec-ok" mode (EPT hook toggling), the *current* mapped_pfn depends on
+      // the last access type (execute vs read). So mapped_pfn==dummy is NOT a reliable indicator.
+      // Instead, query whether this PFN is EPT-hooked and whether the hook read_pfn is dummy.
+      printf("[um] hv.sys EPT (current): orig_pfn=0x%llX mapped_pfn=0x%llX dummy_pfn=0x%llX\n",
+        orig_pfn, mapped_pfn, dummy_pfn);
+
+      ZeroMemory(&qent[1], sizeof(hv::shared_queue_entry));
+      qent[1].cmd    = static_cast<uint32_t>(hv::shared_queue_cmd::query_ept_hook_gpa);
+      qent[1].status = static_cast<uint32_t>(hv::shared_queue_entry_status::pending);
+      qent[1].gpa    = (orig_pfn << 12);
+
+      _mm_mfence();
+      qhdr->head = 2;
+      _mm_mfence();
+      __try { (void)hv::queue_handshake(req); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+      if (sq_wait_done(qhdr, qent, 1, 2000)) {
+        auto const hooked_pfn = qent[1].gpa;
+        auto const hook_read  = qent[1].aux;
+        auto const hook_exec  = qent[1].reserved;
+        auto const hook_dummy = qent[1].cr3;
+        bool const hooked = (hook_read != 0 || hook_exec != 0);
+        bool const self_hide = (hooked && hook_dummy != 0 && hook_read == hook_dummy);
+        printf("[um] hv.sys EPT hook: hooked=%s hooked_pfn=0x%llX read_pfn=0x%llX exec_pfn=0x%llX dummy_pfn=0x%llX => self_hide=%s\n",
+          hooked ? "true" : "false", hooked_pfn, hook_read, hook_exec, hook_dummy, self_hide ? "true" : "false");
+      } else {
+        printf("[um][warn] hv.sys hook check timeout.\n");
+      }
+    } else {
+      printf("[um][warn] hv.sys self-hide check timeout.\n");
+    }
+  } else {
+    printf("[um][warn] failed to locate hv.sys; skip hv.sys self-hide check.\n");
+  }
+
+  // 2) Query PFN of OUR queue page via query_ept_map (so we can test it from a different CR3)
+  ZeroMemory(&qent[2], sizeof(hv::shared_queue_entry));
+  qent[2].cmd    = static_cast<uint32_t>(hv::shared_queue_cmd::query_ept_map);
+  qent[2].status = static_cast<uint32_t>(hv::shared_queue_entry_status::pending);
+  qent[2].cr3    = 0;
+  qent[2].gva    = reinterpret_cast<uint64_t>(queue);
+
+  _mm_mfence();
+  qhdr->head = 3;
+  _mm_mfence();
+  __try { (void)hv::queue_handshake(req); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+  if (!sq_wait_done(qhdr, qent, 2, 2000)) {
+    printf("[um][err] failed to query queue PFN (timeout).\n");
+    deregister_and_free_queue(queue, queue_size, req);
+    return 1;
+  }
+
+  uint64_t const queue_pfn = qent[2].gpa; // orig PFN
+  printf("[um] queue base=%p => pfn=0x%llX\n", queue, queue_pfn);
+
+  // 3) Spawn a child process pinned to the same CPU to check whether that PFN is hidden
+  char exe_path[MAX_PATH] = {};
+  GetModuleFileNameA(nullptr, exe_path, MAX_PATH);
+
+  char cmdline[512] = {};
+  std::snprintf(cmdline, sizeof(cmdline),
+    "\"%s\" --check-queue-hidden 0x%llX %u", exe_path, queue_pfn, cpu_idx);
+
+  STARTUPINFOA si{};
+  si.cb = sizeof(si);
+  PROCESS_INFORMATION pi{};
+  if (!CreateProcessA(nullptr, cmdline, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+    printf("[um][err] CreateProcess failed (gle=0x%08X).\n", GetLastError());
+    deregister_and_free_queue(queue, queue_size, req);
+    return 1;
+  }
+
+  WaitForSingleObject(pi.hProcess, 5000);
+  DWORD exit_code = 0;
+  GetExitCodeProcess(pi.hProcess, &exit_code);
+  CloseHandle(pi.hThread);
+  CloseHandle(pi.hProcess);
+
+  printf("[um] child exit code=%lu (0=hidden, 2=not-hidden)\n", exit_code);
+
+  deregister_and_free_queue(queue, queue_size, req);
+  return 0;
+}
+
 static void run_menu() {
   for (;;) {
     printf("\n========== hv um menu ==========\n");
@@ -800,6 +1068,7 @@ static void run_menu() {
     printf("5) bench-tsc (measure hypercall latency via RDTSC/RDTSCP)\n");
     printf("6) diag-tsc (dump TSC compensation diagnostics via shared-queue)\n");
     printf("7) diag-exits (dump VM-exit/MSR statistics via shared-queue)\n");
+    printf("8) check-hide (hv.sys self-hide + shared-queue EPT hide check)\n");
     printf("0) exit\n");
     printf("Select: ");
     fflush(stdout);
@@ -846,6 +1115,10 @@ static void run_menu() {
       action_diag_exits();
       wait_enter();
       break;
+    case 8:
+      action_check_hide();
+      wait_enter();
+      break;
     case 0:
       return;
     default:
@@ -874,6 +1147,17 @@ int main(int argc, char** argv) {
   if (argc >= 2 && strcmp(argv[1], "--diag-tsc") == 0) {
     action_diag_tsc();
     return 0;
+  }
+
+  // internal: child helper for shared-queue hide detection
+  if (argc >= 4 && strcmp(argv[1], "--check-queue-hidden") == 0) {
+    uint64_t const pfn = parse_u64(argv[2]);
+    uint32_t const cpu = static_cast<uint32_t>(parse_u64(argv[3]));
+    return action_check_queue_hidden(pfn, cpu);
+  }
+
+  if (argc >= 2 && strcmp(argv[1], "--check-hide") == 0) {
+    return action_check_hide();
   }
 
   if (argc >= 2 && strcmp(argv[1], "--demo") == 0) {

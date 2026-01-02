@@ -46,6 +46,11 @@ void emulate_cpuid(vcpu* const cpu) {
     HV_LOG_INFO("[sq] cpuid result: status=%u pages=%u magic=%p",
       static_cast<uint32_t>(res.status), res.page_count, req.magic);
 
+    // If shared-queue EPT hide is enabled, force a re-evaluation immediately so the
+    // newly (de)registered queue becomes visible/hidden without waiting for another VM-exit.
+    cpu->sq_ept_force_update = true;
+    update_shared_queue_ept_hide(cpu);
+
     ctx->rax = hypervisor_signature;
     ctx->rbx = static_cast<uint64_t>(res.status);
     ctx->rcx = res.page_count;
@@ -91,22 +96,15 @@ void emulate_rdmsr(vcpu* const cpu) {
   }
 
   // IMPORTANT:
-  // When "use MSR bitmaps" is enabled, any MSR index outside the bitmap-covered ranges
-  // (0x0000_0000..0x0000_1FFF and 0xC000_0000..0xC000_1FFF) causes an unconditional VM-exit.
-  // Many of those MSRs are undefined on bare metal and would normally raise #GP in the guest.
+  // MSR bitmaps only cover 0..0x1FFF and 0xC000_0000..0xC000_1FFF, but the guest/kernel can
+  // legally access MSRs outside those ranges (CPU/vendor specific). VMX will still VM-exit on
+  // those indices; we must emulate them best-effort.
   //
-  // Avoid executing host RDMSR on these indices (it can #GP in VMX root-mode). Just reflect
-  // the architectural behavior back into the guest.
+  // So: always attempt rdmsr_safe(). If the host faults, reflect #GP(0) into the guest.
   auto const msr = cpu->ctx->ecx;
-  if (!(msr <= 0x1FFFu || (msr >= 0xC0000000u && msr <= 0xC0001FFFu))) {
-    inject_hw_exception(general_protection, 0);
-    return;
-  }
 
   host_exception_info e;
 
-  // the guest could be reading from MSRs that are outside of the MSR bitmap
-  // range. refer to https://www.unknowncheats.me/forum/3425463-post15.html
   auto const msr_value = rdmsr_safe(e, msr);
 
   if (e.exception_occurred) {
@@ -129,7 +127,32 @@ void emulate_wrmsr(vcpu* const cpu) {
   // diag: track which MSRs are causing WRMSR VM-exits
   diag_msr_table_record(cpu->diag_wrmsr_msrs, msr);
 
-  // let the guest write to the MSRs
+  // SAFETY (important for stability / nohv):
+  // Some MSRs are extremely dangerous to pass-through to the host from VMX root mode
+  // (can cause hard hangs with no bugcheck / no dump), notably:
+  // - MTRRs (memory type configuration)
+  // - Performance monitoring control/counters
+  //
+  // nohv intentionally writes these MSRs (often with interrupts disabled) as part of timing checks.
+  // We must NOT apply those writes to the host. Best-effort behavior: accept the write as a no-op.
+  //
+  // Note: this is guest-visible and may make some detections "pass", but it's vastly safer.
+  if (msr == IA32_MTRR_DEF_TYPE     || msr == IA32_MTRR_FIX64K_00000 ||
+      msr == IA32_MTRR_FIX16K_80000 || msr == IA32_MTRR_FIX16K_A0000 ||
+     (msr >= IA32_MTRR_FIX4K_C0000  && msr <= IA32_MTRR_FIX4K_F8000) ||
+     (msr >= IA32_MTRR_PHYSBASE0    && msr <= IA32_MTRR_PHYSBASE0 + 511) ||
+      msr == IA32_PERF_GLOBAL_CTRL  || msr == IA32_FIXED_CTR_CTRL ||
+     (msr >= IA32_FIXED_CTR0        && msr <= IA32_FIXED_CTR2) ||
+     (msr >= IA32_PMC0              && msr <= IA32_PMC7) ||
+     (msr >= IA32_PERFEVTSEL0       && msr <= IA32_PERFEVTSEL0 + 31)) {
+    UNREFERENCED_PARAMETER(value);
+    cpu->hide_vm_exit_overhead = false;
+    skip_instruction();
+    return;
+  }
+
+  // Best-effort: attempt the WRMSR and reflect #GP(0) on fault.
+  // See emulate_rdmsr() for why we must not hard-filter MSR indices by bitmap-covered ranges.
   host_exception_info e;
   wrmsr_safe(e, msr, value);
 
@@ -177,10 +200,14 @@ void emulate_xsetbv(vcpu* const cpu) {
   }
 
   xcr0 new_xcr0;
-  new_xcr0.flags = (cpu->ctx->rdx << 32) | cpu->ctx->eax;
+  // Architectural behavior: XSETBV uses ECX index and EDX:EAX value (upper 32 bits are ignored).
+  uint32_t const idx32 = static_cast<uint32_t>(cpu->ctx->ecx);
+  uint32_t const eax32 = static_cast<uint32_t>(cpu->ctx->eax);
+  uint32_t const edx32 = static_cast<uint32_t>(cpu->ctx->edx);
+  new_xcr0.flags = (static_cast<uint64_t>(edx32) << 32) | static_cast<uint64_t>(eax32);
 
   // only XCR0 is supported
-  if (cpu->ctx->ecx != 0) {
+  if (idx32 != 0) {
     inject_hw_exception(general_protection, 0);
     return;
   }
@@ -221,17 +248,13 @@ void emulate_xsetbv(vcpu* const cpu) {
     return;
   }
 
-  host_exception_info e;
-  xsetbv_safe(e, cpu->ctx->ecx, new_xcr0.flags);
-
-  if (e.exception_occurred) {
-    // TODO: assert that it was a #GP(0) that occurred, although I really
-    //       doubt that any other exception could happen (according to manual).
-    inject_hw_exception(general_protection, 0);
-    return;
-  }
-
-  HV_LOG_VERBOSE("Wrote %p to XCR0.", new_xcr0.flags);
+  // SAFETY:
+  // Do NOT execute XSETBV in VMX root mode. It would modify host XCR0 and can destabilize/hang
+  // the system, especially under anti-VM probes (e.g. nohv) that intentionally try invalid
+  // values while interrupts are disabled.
+  //
+  // Best-effort: accept valid writes as a guest-only shadow update.
+  cpu->guest_xcr0 = new_xcr0.flags;
 
   cpu->hide_vm_exit_overhead = false;
   skip_instruction();
@@ -678,7 +701,7 @@ void handle_ept_violation(vcpu* const cpu) {
     pte->read_access       = 1;
     pte->write_access      = 1;
     pte->execute_access    = 0;
-    pte->page_frame_number = hook->orig_pfn;
+    pte->page_frame_number = hook->read_pfn;
   }
 }
 

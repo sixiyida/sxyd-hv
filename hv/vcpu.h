@@ -136,6 +136,10 @@ struct vcpu {
   // current preemption timer
   uint64_t preemption_timer;
 
+  // ---- guest shadow state (best-effort) ----
+  // We must not modify host XCR0 from VMX root mode when emulating guest XSETBV.
+  uint64_t guest_xcr0;
+
   // the overhead caused by world-transitions
   uint64_t vm_exit_tsc_overhead;
   uint64_t vm_exit_mperf_overhead;
@@ -157,6 +161,14 @@ struct vcpu {
 
   // whether EPT self-hide has been applied for this vcpu
   bool ept_hide_applied;
+
+  // ---- EPT hide for shared-queue (best-effort) ----
+  // last CR3 value for which we evaluated shared-queue EPT visibility
+  uint64_t sq_ept_last_guest_cr3;
+  // CR3 currently "unhidden" (queue visible) in EPT; 0 means none
+  uint64_t sq_ept_visible_cr3;
+  // force re-evaluation on the next VM-exit (e.g. after CPUID (de)register)
+  bool     sq_ept_force_update;
 
   // ---- diag: VM-exit counters ----
   uint64_t diag_exit_total;

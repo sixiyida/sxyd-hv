@@ -250,9 +250,43 @@ bool handle_vm_exit(guest_context* const ctx) {
   if (!cpu->ept_hide_applied && !ghv.stop_requested && ghv.hide_pending &&
       ghv.hv_image_pfns && ghv.hv_image_pfn_count) {
     __try {
-      hide_pfns_in_ept(cpu->ept, ghv.hv_image_pfns, ghv.hv_image_pfn_count);
+      // IMPORTANT:
+      // Do NOT remap hv.sys pages to dummy unconditionally: that breaks guest execution of hv.sys
+      // (DriverEntry/dispatch/unload) and can crash immediately.
+      //
+      // Instead, install EPT hooks so that:
+      // - instruction fetches execute the real page
+      // - reads/writes see the dummy page
+      //
+      // This provides "read-hide" without breaking code execution.
+      uint32_t const max_hooks = static_cast<uint32_t>(cpu->ept.hooks.capacity);
+      uint32_t const count = (ghv.hv_image_pfn_count < max_hooks) ? ghv.hv_image_pfn_count : max_hooks;
+
+      cpu->ept.hv_hide_pages_total = count;
+      cpu->ept.hv_hide_pages_walked = 0;
+      cpu->ept.hv_hide_pages_applied = 0;
+      cpu->ept.hv_hide_pages_pte_null = 0;
+      cpu->ept.hv_hide_pages_invalid_va = 0;
+      cpu->ept.hv_hide_pages_phys0 = 0;
+      cpu->ept.hv_hide_pages_faulted = 0;
+
+      for (uint32_t i = 0; i < count; ++i) {
+        cpu->ept.hv_hide_pages_walked += 1;
+        auto const pfn = ghv.hv_image_pfns[i];
+        if (!pfn) {
+          cpu->ept.hv_hide_pages_phys0 += 1;
+          continue;
+        }
+
+        // Hook key = hv page PFN. Read PFN = dummy page. Exec PFN = hv page PFN.
+        if (!install_ept_hook_adv(cpu->ept, pfn, cpu->ept.dummy_page_pfn, pfn)) {
+          cpu->ept.hv_hide_pages_pte_null += 1;
+          continue;
+        }
+        cpu->ept.hv_hide_pages_applied += 1;
+      }
     } __except (1) {
-      DbgPrint("[hv] handle_vm_exit: hide_pfns_in_ept faulted, skipping.\n");
+      DbgPrint("[hv] handle_vm_exit: hv self-hide hook install faulted, skipping.\n");
     }
 
     if (cpu->ept.hv_hide_pages_total &&
@@ -323,6 +357,10 @@ bool handle_vm_exit(guest_context* const ctx) {
     dispatch_vm_exit(cpu, reason);
 
   if (!cpu->stop_virtualization) {
+    // Best-effort: if enabled, hide shared-queue pages in EPT for unrelated CR3s.
+    // This must run AFTER dispatch_vm_exit() because MOV CR3 emulation updates VMCS_GUEST_CR3.
+    update_shared_queue_ept_hide(cpu);
+
     // 处理共享队列，并根据是否有负载/待处理调整 VMX preemption timer
     bool has_pending = false;
     auto const processed = process_shared_queue(cpu, &has_pending);
@@ -389,7 +427,15 @@ bool handle_vm_exit(guest_context* const ctx) {
     // If we hid hv.sys pages, we MUST unhide before returning to the guest.
     // Driver unload runs in the guest and expects hv.sys code/data to be readable/executable.
     if (cpu->ept_hide_applied && ghv.hv_image_pfns && ghv.hv_image_pfn_count) {
-      unhide_pfns_in_ept(cpu->ept, ghv.hv_image_pfns, ghv.hv_image_pfn_count);
+      // Remove EPT hooks for the pages we hid.
+      uint32_t const max_hooks = static_cast<uint32_t>(cpu->ept.hooks.capacity);
+      uint32_t const count = (ghv.hv_image_pfn_count < max_hooks) ? ghv.hv_image_pfn_count : max_hooks;
+      for (uint32_t i = 0; i < count; ++i) {
+        auto const pfn = ghv.hv_image_pfns[i];
+        if (!pfn)
+          continue;
+        remove_ept_hook(cpu->ept, pfn);
+      }
       cpu->ept_hide_applied = false;
       DbgPrint("[hv] unhide applied for devirtualization.\n");
     }
@@ -603,6 +649,7 @@ bool virtualize_cpu(vcpu* const cpu) {
   cpu->queued_nmis               = 0;
   cpu->tsc_offset                = 0;
   cpu->preemption_timer          = 0;
+  cpu->guest_xcr0                = _xgetbv(0); // snapshot host XCR0 as initial guest XCR0
   cpu->vm_exit_tsc_overhead      = 0;
   cpu->vm_exit_mperf_overhead    = 0;
   cpu->vm_exit_ref_tsc_overhead  = 0;

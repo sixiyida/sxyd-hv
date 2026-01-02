@@ -7,6 +7,7 @@
 #include "exception-routines.h"
 #include "hv.h"
 #include "ept.h"
+#include "mm.h"
 
 namespace hv {
 
@@ -22,6 +23,110 @@ static tsc_diag_snapshot g_tsc_diag_ring[HV_TSC_DIAG_RING_SIZE] = {};
 #endif
 
 } // namespace
+
+#if 1
+// Update EPT mapping for shared-queue pages:
+// - If the currently running CR3 owns a registered queue: ensure those PFNs are identity-mapped in EPT (visible).
+// - Otherwise: ensure the previously-visible queue PFNs are remapped to dummy_page (hidden).
+//
+// Why this works:
+// - Guest accesses go through EPT, so remapping hides the real page contents from other contexts.
+// - Root-mode queue processing uses host_physical_memory_base + GPA, which does NOT go through EPT.
+//
+// Limitations:
+// - Best-effort only. If a queue is deregistered and its PFNs get reused, we avoid acting on stale PFNs by
+//   re-querying the registry before hiding/unhiding.
+void update_shared_queue_ept_hide(vcpu* const cpu) {
+  if (!cpu)
+    return;
+
+  // Global kill-switch (default off).
+  if (!ghv.sq_hide_enabled)
+    return;
+
+  cr3 guest_cr3;
+  guest_cr3.flags = vmx_vmread(VMCS_GUEST_CR3);
+
+  // Avoid doing work on every VM-exit unless CR3 changed or forced.
+  if (!cpu->sq_ept_force_update && cpu->sq_ept_last_guest_cr3 == guest_cr3.flags)
+    return;
+
+  cpu->sq_ept_last_guest_cr3 = guest_cr3.flags;
+  cpu->sq_ept_force_update = false;
+
+  // Determine if there is an active queue for the CURRENT CR3.
+  shared_queue_context cur_ctx{};
+  bool cur_has_queue = get_shared_queue_context(guest_cr3, &cur_ctx);
+
+  auto validate_ctx_pfns = [&](cr3 const target_cr3, shared_queue_context const& ctx) -> bool {
+    // Validate that the registered PFNs still match the current guest page tables for that CR3.
+    // This is critical because EPT remaps PFNs globally: if the queue pages were freed and the
+    // physical pages got reused for unrelated kernel/user allocations, keeping them mapped to
+    // dummy_page would corrupt random memory and can crash the system (e.g. lsass).
+    auto const base_page_va = ctx.queue_gva & ~0xFFFull;
+    for (uint32_t i = 0; i < ctx.page_count; ++i) {
+      auto const page_gva = reinterpret_cast<void*>(base_page_va + (static_cast<uint64_t>(i) << 12));
+      auto const gpa = gva2gpa(target_cr3, page_gva, nullptr);
+      if (!gpa)
+        return false;
+      if ((gpa >> 12) != ctx.page_pfns[i])
+        return false;
+    }
+    return true;
+  };
+
+  // If the current CR3 claims to own a queue but the PFNs no longer match, invalidate it and
+  // restore identity mapping for the stale PFNs (best-effort safety).
+  if (cur_has_queue && !validate_ctx_pfns(guest_cr3, cur_ctx)) {
+    __try {
+      unhide_pfns_in_ept(cpu->ept, cur_ctx.page_pfns, cur_ctx.page_count);
+    } __except (1) {}
+    invalidate_shared_queue(guest_cr3);
+    cur_has_queue = false;
+  }
+
+  // If we previously had a visible queue, and we're no longer in that CR3 (or it no longer has a queue),
+  // re-hide it (if it still exists in the registry).
+  if (cpu->sq_ept_visible_cr3) {
+    cr3 prev_cr3;
+    prev_cr3.flags = cpu->sq_ept_visible_cr3;
+
+    if (prev_cr3.flags != guest_cr3.flags || !cur_has_queue) {
+      shared_queue_context prev_ctx{};
+      if (get_shared_queue_context(prev_cr3, &prev_ctx)) {
+        // Validate before applying any EPT remap to avoid poisoning reused physical pages.
+        if (!validate_ctx_pfns(prev_cr3, prev_ctx)) {
+          __try {
+            unhide_pfns_in_ept(cpu->ept, prev_ctx.page_pfns, prev_ctx.page_count);
+          } __except (1) {}
+          invalidate_shared_queue(prev_cr3);
+        } else {
+        __try {
+          hide_pfns_in_ept(cpu->ept, prev_ctx.page_pfns, prev_ctx.page_count);
+          // hide_pfns_in_ept() does not flush; do it here.
+          vmx_invept(invept_all_context, {});
+        } __except (1) {
+          // best-effort: ignore
+        }
+        }
+      }
+
+      cpu->sq_ept_visible_cr3 = 0;
+    }
+  }
+
+  // If current CR3 owns a queue, ensure it's visible in EPT.
+  if (cur_has_queue) {
+    __try {
+      unhide_pfns_in_ept(cpu->ept, cur_ctx.page_pfns, cur_ctx.page_count);
+      cpu->sq_ept_visible_cr3 = guest_cr3.flags;
+    } __except (1) {
+      // best-effort
+      cpu->sq_ept_visible_cr3 = 0;
+    }
+  }
+}
+#endif
 
 #if 1
 static void exit_stats_build_msr_top(
@@ -546,6 +651,80 @@ uint32_t process_shared_queue(vcpu* const cpu, bool* const has_pending) {
       entry->gpa      = (gpa >> 12);
       entry->aux      = pte->page_frame_number;
       entry->reserved = cpu->ept.dummy_page_pfn;
+      entry->status   = static_cast<uint32_t>(shared_queue_entry_status::done);
+    } break;
+
+    case shared_queue_cmd::query_ept_gpa: {
+      // Input:
+      //   entry->gpa : guest physical address to query
+      // Output:
+      //   entry->gpa      = original PFN (gpa >> 12)
+      //   entry->aux      = mapped PFN in EPT (for this VCPU's EPT)
+      //   entry->reserved = dummy PFN (for comparison)
+      auto const gpa = entry->gpa;
+      if (!gpa) {
+        entry->status = static_cast<uint32_t>(shared_queue_entry_status::err_translate);
+        goto done_entry;
+      }
+
+      uint64_t mapped_pfn = 0;
+
+      if (auto const pte = get_ept_pte(cpu->ept, gpa, false)) {
+        mapped_pfn = pte->page_frame_number;
+      } else {
+        // If the mapping is still a 2MB large page, derive the PFN from the PDE.
+        // NOTE: if the PDE is already split, get_ept_pte() should have succeeded above.
+        pml4_virtual_address const addr = { reinterpret_cast<void*>(gpa) };
+        if (addr.pml4_idx == 0 && addr.pdpt_idx < ept_pd_count) {
+          auto const& pde2 = cpu->ept.pds_2mb[addr.pdpt_idx][addr.pd_idx];
+          if (pde2.large_page) {
+            mapped_pfn = (pde2.page_frame_number << 9) + addr.pt_idx;
+          }
+        }
+      }
+
+      if (!mapped_pfn) {
+        entry->status = static_cast<uint32_t>(shared_queue_entry_status::err_translate);
+        goto done_entry;
+      }
+
+      entry->gpa      = (gpa >> 12);
+      entry->aux      = mapped_pfn;
+      entry->reserved = cpu->ept.dummy_page_pfn;
+      entry->status   = static_cast<uint32_t>(shared_queue_entry_status::done);
+    } break;
+
+    case shared_queue_cmd::query_ept_hook_gpa: {
+      // Input:
+      //   entry->gpa : guest physical address to query (we key hooks by PFN)
+      // Output (best-effort):
+      //   entry->gpa      = hooked PFN (gpa >> 12)
+      //   entry->aux      = hook read PFN
+      //   entry->reserved = hook exec PFN
+      //   entry->cr3      = dummy PFN (for comparison)
+      auto const gpa = entry->gpa;
+      if (!gpa) {
+        entry->status = static_cast<uint32_t>(shared_queue_entry_status::err_translate);
+        goto done_entry;
+      }
+
+      auto const pfn = (gpa >> 12);
+      auto const hook = find_ept_hook(cpu->ept, pfn);
+      if (!hook) {
+        // Not hooked: return zeros but mark done so the caller can distinguish "not hooked"
+        // from translation errors.
+        entry->gpa      = pfn;
+        entry->aux      = 0;
+        entry->reserved = 0;
+        entry->cr3      = cpu->ept.dummy_page_pfn;
+        entry->status   = static_cast<uint32_t>(shared_queue_entry_status::done);
+        goto done_entry;
+      }
+
+      entry->gpa      = pfn;
+      entry->aux      = hook->read_pfn;
+      entry->reserved = hook->exec_pfn;
+      entry->cr3      = cpu->ept.dummy_page_pfn;
       entry->status   = static_cast<uint32_t>(shared_queue_entry_status::done);
     } break;
 

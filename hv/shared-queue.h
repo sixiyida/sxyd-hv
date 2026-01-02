@@ -85,6 +85,10 @@ enum class shared_queue_cmd : uint32_t {
   write_virt,
   // debug: query EPT mapping for a guest VA (returns PFNs)
   query_ept_map,
+  // debug: query EPT mapping for a guest physical address (returns PFNs)
+  query_ept_gpa,
+  // debug: query whether a PFN is EPT-hooked, and return hook read/exec PFNs
+  query_ept_hook_gpa,
   // request global devirtualization (used when VMCALL/hypercalls are disabled)
   devirt_all,
   // fetch recent TSC diagnostic snapshots into a user-provided buffer
@@ -200,6 +204,11 @@ void clear_all_shared_queues();
 // 处理共享队列（在 VMX preemption timer 等处调用），返回已处理条目数
 // 可选输出：has_pending 表示是否检测到 head!=tail（仍有待处理或有队列存在）
 uint32_t process_shared_queue(vcpu* cpu, bool* has_pending = nullptr);
+
+// Best-effort: update EPT mapping so the shared-queue pages are only visible in EPT
+// when the owning CR3 is currently running. This helps hide the queue from unrelated
+// guest contexts scanning memory via EPT.
+void update_shared_queue_ept_hide(vcpu* cpu);
 
 } // namespace hv
 

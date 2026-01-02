@@ -10,7 +10,14 @@ namespace hv {
 // NOTE: EPT self-hide is experimental and can easily destabilize unload/startup on new kernels.
 // Keep it disabled by default while debugging stability/performance issues.
 #ifndef HV_ENABLE_EPT_SELF_HIDE
-#define HV_ENABLE_EPT_SELF_HIDE 0
+#define HV_ENABLE_EPT_SELF_HIDE 1
+#endif
+
+// NOTE: EPT hide for shared-queue is also experimental:
+// it remaps user pages to a dummy page in EPT when the owning CR3 is not running.
+// Default: disabled.
+#ifndef HV_ENABLE_EPT_SHARED_QUEUE_HIDE
+#define HV_ENABLE_EPT_SHARED_QUEUE_HIDE 0
 #endif
 // Force a VM-exit on each logical processor by executing CPUID.
 // This is used to make hv::stop() deterministic even when VM-exits are rare.
@@ -246,6 +253,14 @@ bool start() {
   DbgPrint("[hv] EPT self-hide pending (will apply on first VM-exit per VCPU).\n");
 #else
   InterlockedExchange(const_cast<LONG*>(&ghv.hide_pending), 0);
+#endif
+
+  // Enable/disable shared-queue EPT hide (best-effort).
+#if HV_ENABLE_EPT_SHARED_QUEUE_HIDE
+  InterlockedExchange(const_cast<LONG*>(&ghv.sq_hide_enabled), 1);
+  DbgPrint("[hv] EPT shared-queue hide enabled.\n");
+#else
+  InterlockedExchange(const_cast<LONG*>(&ghv.sq_hide_enabled), 0);
 #endif
 
   return true;

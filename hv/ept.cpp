@@ -367,15 +367,16 @@ void split_ept_pde(vcpu_ept_data& ept, ept_pde_2mb* const pde_2mb) {
 
 // memory read/written will use the original page while code
 // being executed will use the executable page instead
-bool install_ept_hook(vcpu_ept_data& ept,
-    uint64_t const original_page_pfn,
+bool install_ept_hook_adv(vcpu_ept_data& ept,
+    uint64_t const hooked_page_pfn,
+    uint64_t const read_page_pfn,
     uint64_t const executable_page_pfn) {
   // we ran out of EPT hooks :(
   if (!ept.hooks.free_list_head)
     return false;
 
   // get the EPT PTE, and possible split an existing PDE if needed
-  auto const pte = get_ept_pte(ept, original_page_pfn << 12, true);
+  auto const pte = get_ept_pte(ept, hooked_page_pfn << 12, true);
   if (!pte)
     return false;
 
@@ -388,8 +389,9 @@ bool install_ept_hook(vcpu_ept_data& ept,
   ept.hooks.active_list_head = hook_node;
 
   // initialize the hook node
-  hook_node->orig_pfn = static_cast<uint32_t>(original_page_pfn);
-  hook_node->exec_pfn = static_cast<uint32_t>(executable_page_pfn);
+  hook_node->hooked_pfn = static_cast<uint32_t>(hooked_page_pfn);
+  hook_node->read_pfn   = static_cast<uint32_t>(read_page_pfn);
+  hook_node->exec_pfn   = static_cast<uint32_t>(executable_page_pfn);
 
   // an instruction fetch to this physical address will now trigger
   // an ept-violation vm-exit where the real "meat" of the ept hook is
@@ -400,13 +402,20 @@ bool install_ept_hook(vcpu_ept_data& ept,
   return true;
 }
 
+bool install_ept_hook(vcpu_ept_data& ept,
+    uint64_t const original_page_pfn,
+    uint64_t const executable_page_pfn) {
+  // Backward-compatible wrapper: read/write stays on the original PFN.
+  return install_ept_hook_adv(ept, original_page_pfn, original_page_pfn, executable_page_pfn);
+}
+
 // remove an EPT hook that was installed with install_ept_hook()
 void remove_ept_hook(vcpu_ept_data& ept, uint64_t const original_page_pfn) {
   if (!ept.hooks.active_list_head)
     return;
 
   // the head is the target node
-  if (ept.hooks.active_list_head->orig_pfn == original_page_pfn) {
+  if (ept.hooks.active_list_head->hooked_pfn == original_page_pfn) {
     auto const new_head = ept.hooks.active_list_head->next;
 
     // add to the free list
@@ -420,7 +429,7 @@ void remove_ept_hook(vcpu_ept_data& ept, uint64_t const original_page_pfn) {
 
     // search for the node BEFORE the target node (prev if this was doubly)
     while (prev->next) {
-      if (prev->next->orig_pfn == original_page_pfn)
+      if (prev->next->hooked_pfn == original_page_pfn)
         break;
 
       prev = prev->next;
@@ -463,7 +472,7 @@ vcpu_ept_hook_node* find_ept_hook(vcpu_ept_data& ept,
 
   // linear search through the active hook list
   for (auto curr = ept.hooks.active_list_head; curr; curr = curr->next) {
-    if (curr->orig_pfn == original_page_pfn)
+    if (curr->hooked_pfn == original_page_pfn)
       return curr;
   }
 
