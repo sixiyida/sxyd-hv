@@ -95,13 +95,18 @@ void emulate_rdmsr(vcpu* const cpu) {
     return;
   }
 
-  // IMPORTANT:
-  // MSR bitmaps only cover 0..0x1FFF and 0xC000_0000..0xC000_1FFF, but the guest/kernel can
-  // legally access MSRs outside those ranges (CPU/vendor specific). VMX will still VM-exit on
-  // those indices; we must emulate them best-effort.
+  // IMPORTANT (stability / nohv):
+  // When "use MSR bitmaps" is enabled, any MSR index outside the bitmap-covered ranges
+  // (0x0000_0000..0x0000_1FFF and 0xC000_0000..0xC000_1FFF) causes an unconditional VM-exit.
   //
-  // So: always attempt rdmsr_safe(). If the host faults, reflect #GP(0) into the guest.
+  // Many of those MSRs are undefined on bare metal (e.g., Hyper-V synthetic MSRs 0x4000_0000+)
+  // and would normally raise #GP in the guest. Executing RDMSR for these indices in VMX root
+  // mode can be risky; instead, reflect the architectural behavior back into the guest.
   auto const msr = cpu->ctx->ecx;
+  if (!(msr <= 0x1FFFu || (msr >= 0xC0000000u && msr <= 0xC0001FFFu))) {
+    inject_hw_exception(general_protection, 0);
+    return;
+  }
 
   host_exception_info e;
 
@@ -126,6 +131,14 @@ void emulate_wrmsr(vcpu* const cpu) {
 
   // diag: track which MSRs are causing WRMSR VM-exits
   diag_msr_table_record(cpu->diag_wrmsr_msrs, msr);
+
+  // See emulate_rdmsr(): indices outside the MSR bitmap covered ranges cause unconditional
+  // VM-exit. For most such MSRs, bare metal behavior is #GP(0). Avoid executing WRMSR in
+  // VMX root mode for these indices; inject #GP into the guest instead.
+  if (!(msr <= 0x1FFFu || (msr >= 0xC0000000u && msr <= 0xC0001FFFu))) {
+    inject_hw_exception(general_protection, 0);
+    return;
+  }
 
   // SAFETY (important for stability / nohv):
   // Some MSRs are extremely dangerous to pass-through to the host from VMX root mode

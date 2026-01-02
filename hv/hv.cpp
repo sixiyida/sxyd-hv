@@ -17,7 +17,7 @@ namespace hv {
 // it remaps user pages to a dummy page in EPT when the owning CR3 is not running.
 // Default: disabled.
 #ifndef HV_ENABLE_EPT_SHARED_QUEUE_HIDE
-#define HV_ENABLE_EPT_SHARED_QUEUE_HIDE 0
+#define HV_ENABLE_EPT_SHARED_QUEUE_HIDE 1
 #endif
 // Force a VM-exit on each logical processor by executing CPUID.
 // This is used to make hv::stop() deterministic even when VM-exits are rare.
