@@ -61,8 +61,7 @@ void hide_vm_exit_overhead(vcpu* const cpu, uint64_t const host_entry_tsc) {
   // however, there appears to be a small, yet constant, overhead that occurs
   // when the CPU is performing these stores and loads. This is the case for
   // every MSR, so naturally PERF_GLOBAL_CTRL is affected as well. If it wasn't
-  // for this, hiding vm-exit overhead would be sooooo much easier and cleaner,
-  // but whatever.
+  // for this, hiding vm-exit overhead via MSR tricks would be much simpler.
   //
 
   ia32_perf_global_ctrl_register perf_global_ctrl;
@@ -84,7 +83,7 @@ void hide_vm_exit_overhead(vcpu* const cpu, uint64_t const host_entry_tsc) {
     ia32_fixed_ctr_ctrl_register fixed_ctr_ctrl;
     fixed_ctr_ctrl.flags = __readmsr(IA32_FIXED_CTR_CTRL);
 
-    // this also needs to be done for many other PMCs, but whatever
+    // This likely needs to be done for additional PMCs for completeness.
     if ((cpl == 0 && fixed_ctr_ctrl.en2_os) || (cpl == 3 && fixed_ctr_ctrl.en2_usr))
       __writemsr(IA32_FIXED_CTR2, __readmsr(IA32_FIXED_CTR2) - cpu->vm_exit_ref_tsc_overhead);
   }  

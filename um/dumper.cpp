@@ -160,6 +160,10 @@ bool dump_driver(char const* const name, char const* path) {
   if (!hv::is_hv_running())
     return false;
 
+  hv::shared_queue_session sq;
+  if (!sq.open())
+    return false;
+
   void*    imagebase = nullptr;
   uint32_t imagesize = 0;
 
@@ -167,7 +171,7 @@ bool dump_driver(char const* const name, char const* path) {
     return false;
 
   auto const buffer = std::make_unique<uint8_t[]>(imagesize);
-  if (imagesize != hv::read_virt_mem(0, buffer.get(), imagebase, imagesize))
+  if (imagesize != sq.read_virtual(/*target_cr3=*/0, buffer.get(), imagebase, imagesize))
     return false;
 
   auto const dos_header = (PIMAGE_DOS_HEADER)&buffer[0];

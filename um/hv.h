@@ -1,53 +1,14 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <intrin.h>
 #include <Windows.h>
 
 namespace hv {
 
-// key used for executing hypercalls
-inline constexpr uint64_t hypercall_key = 69420;
-
-// signature that is returned by the ping hypercall
+// signature that is returned by the CPUID handshake
 inline constexpr uint64_t hypervisor_signature = 'fr0g';
-
-struct logger_msg {
-  static constexpr uint32_t max_msg_length = 128;
-
-  // ID of the current message
-  uint64_t id;
-
-  // timestamp counter of the current message
-  uint64_t tsc;
-
-  // process ID of the VCPU that sent the message
-  uint32_t aux;
-
-  // null-terminated ascii string
-  char data[max_msg_length];
-};
-
-// hypercall indices
-enum hypercall_code : uint64_t {
-  hypercall_ping = 0,
-  hypercall_test,
-  hypercall_unload,
-  hypercall_read_phys_mem,
-  hypercall_write_phys_mem,
-  hypercall_read_virt_mem,
-  hypercall_write_virt_mem,
-  hypercall_query_process_cr3,
-  hypercall_install_ept_hook,
-  hypercall_remove_ept_hook,
-  hypercall_flush_logs,
-  hypercall_get_physical_address,
-  hypercall_hide_physical_page,
-  hypercall_unhide_physical_page,
-  hypercall_get_hv_base,
-  hypercall_install_mmr,
-  hypercall_remove_mmr,
-  hypercall_remove_all_mmrs
-};
 
 // CPUID 握手叶子（共享队列注册）
 inline constexpr uint32_t shared_queue_cpuid_leaf               = 0x80000000;
@@ -205,97 +166,6 @@ struct queue_handshake_result {
   uint64_t             echoed_magic;
 };
 
-// hypercall input
-struct hypercall_input {
-  // rax
-  struct {
-    hypercall_code code : 8;
-    uint64_t       key  : 56;
-  };
-
-  // rcx, rdx, r8, r9, r10, r11
-  uint64_t args[6];
-};
-
-enum mmr_memory_mode {
-  mmr_memory_mode_r = 0b001,
-  mmr_memory_mode_w = 0b010,
-  mmr_memory_mode_x = 0b100
-};
-
-// check if the system is virtualized
-bool is_hv_running();
-
-// call fn() on each logical processor
-template <typename Fn>
-void for_each_cpu(Fn fn);
-
-// ping the hypervisor to make sure it is running (returns hypervisor_signature)
-uint64_t ping();
-
-// a hypercall for quick testing
-uint64_t test(uint64_t a1 = 0, uint64_t a2 = 0,
-              uint64_t a3 = 0, uint64_t a4 = 0,
-              uint64_t a5 = 0, uint64_t a6 = 0);
-
-// read from arbitrary physical memory
-size_t read_phys_mem(void* dst, uint64_t src, size_t size);
-
-// write to arbitrary physical memory
-size_t write_phys_mem(uint64_t dst, void const* src, size_t size);
-
-// read from virtual memory in another process
-size_t read_virt_mem(uint64_t cr3, void* dst, void const* src, size_t size);
-
-// write to virtual memory in another process
-size_t write_virt_mem(uint64_t cr3, void* dst, void const* src, size_t size);
-
-// get the kernel CR3 value of an arbitrary process
-uint64_t query_process_cr3(uint64_t pid);
-
-// install an EPT hook for the CURRENT logical processor ONLY
-bool install_ept_hook(uint64_t orig_page_pfn, uint64_t exec_page_pfn);
-
-// remove a previously installed EPT hook
-void remove_ept_hook(uint64_t orig_page_pfn);
-
-// flush the hypervisor logs into a buffer
-void flush_logs(uint32_t& count, logger_msg* msgs);
-
-// translate a virtual address to its physical address
-uint64_t get_physical_address(uint64_t cr3, void const* address);
-
-// hide a physical page from the guest
-bool hide_physical_page(uint64_t pfn);
-
-// unhide a physical page from the guest
-void unhide_physical_page(uint64_t pfn);
-
-// get the base address of the hypervisor
-void* get_hv_base();
-
-// write to the logger whenever a certain physical memory range is accessed
-void* install_mmr(uint64_t address, uint32_t size, uint8_t mode);
-
-// remove an existing MMR
-void remove_mmr(void* handle);
-
-// remove every installed MMR
-void remove_all_mmrs();
-
-// VMCALL instruction, defined in hv.asm
-uint64_t vmx_vmcall(hypercall_input& input);
-
-namespace detail {
-inline uint64_t vmx_vmcall_safe(hypercall_input& input) {
-  __try {
-    return hv::vmx_vmcall(input);
-  } __except (EXCEPTION_EXECUTE_HANDLER) {
-    return 0;
-  }
-}
-} // namespace detail
-
 // CPUID 握手，用于注册共享队列（定义在 hv.asm）
 extern "C" void __fastcall hv_queue_handshake_asm(
   queue_handshake_request const* req,
@@ -312,6 +182,214 @@ inline queue_handshake_result queue_handshake(queue_handshake_request const& req
   res.echoed_magic = raw.rdx;
   return res;
 }
+
+// A clean UM-side shared-queue session:
+// - explicitly owns a queue buffer (VirtualAlloc)
+// - registers via CPUID handshake
+// - submits commands by writing entries and "kicking" via CPUID to trigger a VM-exit
+class shared_queue_session {
+public:
+  static constexpr size_t   default_queue_size = 0x2000; // 2 pages
+  static constexpr uint64_t default_magic      = 0xC0FFEE123456789ull;
+  static constexpr uint64_t default_seed       = 0xBADF00DCAFEBABEull;
+
+  shared_queue_session() = default;
+
+  shared_queue_session(size_t const queue_size, uint64_t const magic, uint64_t const seed) {
+    (void)open(queue_size, magic, seed);
+  }
+
+  shared_queue_session(shared_queue_session const&) = delete;
+  shared_queue_session& operator=(shared_queue_session const&) = delete;
+
+  ~shared_queue_session() { close(); }
+
+  bool open(size_t const queue_size = default_queue_size,
+            uint64_t const magic = default_magic,
+            uint64_t const seed = default_seed) {
+    if (registered_)
+      return true;
+
+    queue_size_ = queue_size ? queue_size : default_queue_size;
+    queue_ = static_cast<uint8_t*>(
+      VirtualAlloc(nullptr, queue_size_, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+
+    if (!queue_) {
+      queue_size_ = 0;
+      return false;
+    }
+
+    // Best-effort: keep pages resident to reduce translation failures.
+    (void)VirtualLock(queue_, queue_size_);
+
+    ZeroMemory(queue_, queue_size_);
+
+    req_ = {};
+    req_.queue = queue_;
+    req_.size  = static_cast<uint32_t>(queue_size_);
+    req_.magic = magic;
+    req_.seed  = seed;
+
+    last_hs_ = {};
+    __try {
+      last_hs_ = queue_handshake(req_);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+      last_hs_.signature = 0;
+      last_hs_.status = static_cast<queue_register_status>(0xFFFF'FFFFu);
+      last_hs_.page_count = 0;
+      last_hs_.echoed_magic = 0;
+    }
+
+    if (last_hs_.signature != hypervisor_signature ||
+        last_hs_.status != queue_register_status::success) {
+      close();
+      return false;
+    }
+
+    registered_ = true;
+    return true;
+  }
+
+  void close() {
+    if (!queue_ || !queue_size_)
+      return;
+
+    if (registered_) {
+      queue_handshake_request dereg{};
+      dereg.queue = nullptr;
+      dereg.size  = 0;
+      dereg.magic = req_.magic;
+      dereg.seed  = req_.seed;
+      __try { (void)queue_handshake(dereg); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+
+    VirtualUnlock(queue_, queue_size_);
+    VirtualFree(queue_, 0, MEM_RELEASE);
+
+    queue_ = nullptr;
+    queue_size_ = 0;
+    registered_ = false;
+    req_ = {};
+    last_hs_ = {};
+  }
+
+  [[nodiscard]] bool ok() const { return registered_; }
+  [[nodiscard]] queue_handshake_result last_handshake() const { return last_hs_; }
+  [[nodiscard]] void* raw_queue() const { return queue_; }
+  [[nodiscard]] shared_queue_header* header() const { return queue_ ? sq_header(queue_) : nullptr; }
+  [[nodiscard]] shared_queue_entry* entries() const { return queue_ ? sq_entries(queue_) : nullptr; }
+
+  // Submit a single entry (idx=0) and wait for completion.
+  // On success, in_out is replaced with the completed entry (status/aux/reserved filled by HV).
+  bool submit(shared_queue_entry& in_out, uint32_t timeout_ms = 2000) {
+    if (!registered_ && !open())
+      return false;
+
+    auto* const qhdr = header();
+    auto* const qent = entries();
+    if (!qhdr || !qent)
+      return false;
+
+    qhdr->head = 0;
+    qhdr->tail = 0;
+    ZeroMemory(&qent[0], sizeof(shared_queue_entry));
+
+    qent[0] = in_out;
+    qent[0].status = static_cast<uint32_t>(shared_queue_entry_status::pending);
+
+    _mm_mfence();
+    qhdr->head = 1;
+    _mm_mfence();
+
+    kick_vmexit();
+
+    DWORD waited = 0;
+    while (waited < timeout_ms) {
+      auto const st = qent[0].status;
+      if (st != static_cast<uint32_t>(shared_queue_entry_status::pending))
+        break;
+
+      if ((waited % 50) == 0)
+        kick_vmexit();
+
+      Sleep(10);
+      waited += 10;
+    }
+
+    in_out = qent[0];
+    return in_out.status == static_cast<uint32_t>(shared_queue_entry_status::done);
+  }
+
+  // Convenience ops (shared-queue semantics, no legacy hypercall compatibility):
+  size_t read_physical(void* dst, uint64_t gpa, size_t size, uint32_t timeout_ms = 2000) {
+    if (size == 0 || size > 0xFFFF'FFFFull)
+      return 0;
+    shared_queue_entry e{};
+    e.cmd  = static_cast<uint32_t>(shared_queue_cmd::read_phys);
+    e.gva  = reinterpret_cast<uint64_t>(dst);
+    e.gpa  = gpa;
+    e.size = static_cast<uint32_t>(size);
+    if (!submit(e, timeout_ms))
+      return 0;
+    return static_cast<size_t>(e.aux);
+  }
+
+  size_t write_physical(uint64_t gpa, void const* src, size_t size, uint32_t timeout_ms = 2000) {
+    if (size == 0 || size > 0xFFFF'FFFFull)
+      return 0;
+    shared_queue_entry e{};
+    e.cmd  = static_cast<uint32_t>(shared_queue_cmd::write_phys);
+    e.gva  = reinterpret_cast<uint64_t>(src);
+    e.gpa  = gpa;
+    e.size = static_cast<uint32_t>(size);
+    if (!submit(e, timeout_ms))
+      return 0;
+    return static_cast<size_t>(e.aux);
+  }
+
+  // Read virtual memory from target CR3 into current-process dst buffer.
+  // If target_cr3==0, HV uses current guest CR3.
+  size_t read_virtual(uint64_t target_cr3, void* dst, void const* src, size_t size, uint32_t timeout_ms = 2000) {
+    if (size == 0 || size > 0xFFFF'FFFFull)
+      return 0;
+    shared_queue_entry e{};
+    e.cmd  = static_cast<uint32_t>(shared_queue_cmd::read_virt);
+    e.cr3  = target_cr3;
+    e.gva  = reinterpret_cast<uint64_t>(src); // src VA (target CR3)
+    e.gpa  = reinterpret_cast<uint64_t>(dst); // dst VA (current process)
+    e.size = static_cast<uint32_t>(size);
+    if (!submit(e, timeout_ms))
+      return 0;
+    return static_cast<size_t>(e.aux);
+  }
+
+  // Write virtual memory from current-process src buffer into target CR3 dst VA.
+  size_t write_virtual(uint64_t target_cr3, void* dst, void const* src, size_t size, uint32_t timeout_ms = 2000) {
+    if (size == 0 || size > 0xFFFF'FFFFull)
+      return 0;
+    shared_queue_entry e{};
+    e.cmd  = static_cast<uint32_t>(shared_queue_cmd::write_virt);
+    e.cr3  = target_cr3;
+    e.gva  = reinterpret_cast<uint64_t>(dst); // dst VA (target CR3)
+    e.gpa  = reinterpret_cast<uint64_t>(src); // src VA (current process)
+    e.size = static_cast<uint32_t>(size);
+    if (!submit(e, timeout_ms))
+      return 0;
+    return static_cast<size_t>(e.aux);
+  }
+
+private:
+  static void kick_vmexit() {
+    int regs[4] = {};
+    __cpuid(regs, 0);
+  }
+
+  uint8_t*               queue_      = nullptr;
+  size_t                 queue_size_ = 0;
+  queue_handshake_request req_{};
+  queue_handshake_result  last_hs_{};
+  bool                   registered_ = false;
+};
 
 /**
 * 
@@ -332,6 +410,19 @@ inline bool is_hv_running() {
   return false;
 }
 
+// ping the hypervisor to make sure it is running (returns hypervisor_signature)
+inline uint64_t ping() {
+  hv::queue_handshake_request req{};
+  req.queue = nullptr;
+  req.size  = 0;
+  __try {
+    auto const res = hv::queue_handshake(req);
+    return res.signature;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return 0;
+  }
+}
+
 // call fn() on each logical processor
 template <typename Fn>
 inline void for_each_cpu(Fn const fn) {
@@ -343,191 +434,6 @@ inline void for_each_cpu(Fn const fn) {
     fn(i);
     SetThreadAffinityMask(GetCurrentThread(), prev_affinity);
   }
-}
-
-// ping the hypervisor to make sure it is running (returns hypervisor_signature)
-inline uint64_t ping() {
-  hv::hypercall_input input;
-  input.code = hv::hypercall_ping;
-  input.key  = hv::hypercall_key;
-  return hv::detail::vmx_vmcall_safe(input);
-}
-
-// a hypercall for quick testing
-inline uint64_t test(uint64_t const a1, uint64_t const a2,
-                     uint64_t const a3, uint64_t const a4,
-                     uint64_t const a5, uint64_t const a6) {
-  hv::hypercall_input input;
-  input.code = hv::hypercall_test;
-  input.key  = hv::hypercall_key;
-  input.args[0] = a1;
-  input.args[1] = a2;
-  input.args[2] = a3;
-  input.args[3] = a4;
-  input.args[4] = a5;
-  input.args[5] = a6;
-  return hv::detail::vmx_vmcall_safe(input);
-}
-
-// devirtualize the CURRENT logical processor ONLY
-inline void unload() {
-  hv::hypercall_input input{};
-  input.code = hv::hypercall_unload;
-  input.key  = hv::hypercall_key;
-  hv::detail::vmx_vmcall_safe(input);
-}
-
-// read from arbitrary physical memory
-inline size_t read_phys_mem(void* const dst, uint64_t const src,
-                            size_t const size) {
-  hv::hypercall_input input;
-  input.code    = hv::hypercall_read_phys_mem;
-  input.key     = hv::hypercall_key;
-  input.args[0] = reinterpret_cast<uint64_t>(dst);
-  input.args[1] = src;
-  input.args[2] = size;
-  return hv::detail::vmx_vmcall_safe(input);
-}
-
-// write to arbitrary physical memory
-inline size_t write_phys_mem(uint64_t const dst, void const* const src,
-                             size_t const size) {
-  hv::hypercall_input input;
-  input.code    = hv::hypercall_write_phys_mem;
-  input.key     = hv::hypercall_key;
-  input.args[0] = dst;
-  input.args[1] = reinterpret_cast<uint64_t>(src);
-  input.args[2] = size;
-  return hv::detail::vmx_vmcall_safe(input);
-}
-
-// read from virtual memory in another process
-inline size_t read_virt_mem(uint64_t const cr3, void* const dst,
-                            void const* const src, size_t const size) {
-  hv::hypercall_input input;
-  input.code    = hv::hypercall_read_virt_mem;
-  input.key     = hv::hypercall_key;
-  input.args[0] = cr3;
-  input.args[1] = reinterpret_cast<uint64_t>(dst);
-  input.args[2] = reinterpret_cast<uint64_t>(src);
-  input.args[3] = size;
-  return hv::detail::vmx_vmcall_safe(input);
-}
-
-// write to virtual memory in another process
-inline size_t write_virt_mem(uint64_t const cr3, void* const dst,
-                             void const* const src, size_t const size) {
-  hv::hypercall_input input;
-  input.code    = hv::hypercall_write_virt_mem;
-  input.key     = hv::hypercall_key;
-  input.args[0] = cr3;
-  input.args[1] = reinterpret_cast<uint64_t>(dst);
-  input.args[2] = reinterpret_cast<uint64_t>(src);
-  input.args[3] = size;
-  return hv::detail::vmx_vmcall_safe(input);
-}
-
-// get the kernel CR3 value of an arbitrary process
-inline uint64_t query_process_cr3(uint64_t const pid) {
-  hv::hypercall_input input;
-  input.code    = hv::hypercall_query_process_cr3;
-  input.key     = hv::hypercall_key;
-  input.args[0] = pid;
-  return hv::detail::vmx_vmcall_safe(input);
-}
-
-// install an EPT hook for the CURRENT logical processor ONLY
-inline bool install_ept_hook(uint64_t const orig_page_pfn, uint64_t const exec_page_pfn) {
-  hv::hypercall_input input;
-  input.code    = hv::hypercall_install_ept_hook;
-  input.key     = hv::hypercall_key;
-  input.args[0] = orig_page_pfn;
-  input.args[1] = exec_page_pfn;
-  return hv::detail::vmx_vmcall_safe(input);
-}
-
-// remove a previously installed EPT hook
-inline void remove_ept_hook(uint64_t const orig_page_pfn) {
-  hv::hypercall_input input;
-  input.code    = hv::hypercall_remove_ept_hook;
-  input.key     = hv::hypercall_key;
-  input.args[0] = orig_page_pfn;
-  hv::detail::vmx_vmcall_safe(input);
-}
-
-// flush the hypervisor logs into a buffer
-inline void flush_logs(uint32_t& count, logger_msg* const msgs) {
-  hv::hypercall_input input;
-  input.code    = hv::hypercall_flush_logs;
-  input.key     = hv::hypercall_key;
-  input.args[0] = count;
-  input.args[1] = reinterpret_cast<uint64_t>(msgs);
-  count = static_cast<uint32_t>(hv::detail::vmx_vmcall_safe(input));
-}
-
-// translate a virtual address to its physical address
-inline uint64_t get_physical_address(uint64_t const cr3, void const* const address) {
-  hv::hypercall_input input;
-  input.code    = hv::hypercall_get_physical_address;
-  input.key     = hv::hypercall_key;
-  input.args[0] = cr3;
-  input.args[1] = reinterpret_cast<uint64_t>(address);
-  return hv::detail::vmx_vmcall_safe(input);
-}
-
-// hide a physical page from the guest
-inline bool hide_physical_page(uint64_t const pfn) {
-  hv::hypercall_input input;
-  input.code    = hv::hypercall_hide_physical_page;
-  input.key     = hv::hypercall_key;
-  input.args[0] = pfn;
-  return hv::detail::vmx_vmcall_safe(input);
-}
-
-// unhide a physical page from the guest
-inline void unhide_physical_page(uint64_t const pfn) {
-  hv::hypercall_input input;
-  input.code    = hv::hypercall_unhide_physical_page;
-  input.key     = hv::hypercall_key;
-  input.args[0] = pfn;
-  hv::detail::vmx_vmcall_safe(input);
-}
-
-// get the base address of the hypervisor
-inline void* get_hv_base() {
-  hv::hypercall_input input;
-  input.code = hv::hypercall_get_hv_base;
-  input.key  = hv::hypercall_key;
-  return reinterpret_cast<void*>(hv::detail::vmx_vmcall_safe(input));
-}
-
-// write to the logger whenever a certain physical memory range is accessed
-inline void* install_mmr(uint64_t const address, uint32_t const size,
-                         uint8_t const mode) {
-  hv::hypercall_input input;
-  input.code    = hv::hypercall_install_mmr;
-  input.key     = hv::hypercall_key;
-  input.args[0] = address;
-  input.args[1] = size;
-  input.args[2] = mode;
-  return reinterpret_cast<void*>(hv::detail::vmx_vmcall_safe(input));
-}
-
-// remove an existing MMR
-inline void remove_mmr(void* const handle) {
-  hv::hypercall_input input;
-  input.code = hv::hypercall_remove_mmr;
-  input.key  = hv::hypercall_key;
-  input.args[0] = reinterpret_cast<uint64_t>(handle);
-  hv::detail::vmx_vmcall_safe(input);
-}
-
-// remove every installed MMR
-inline void remove_all_mmrs() {
-  hv::hypercall_input input;
-  input.code = hv::hypercall_remove_all_mmrs;
-  input.key  = hv::hypercall_key;
-  hv::detail::vmx_vmcall_safe(input);
 }
 
 } // namespace hv

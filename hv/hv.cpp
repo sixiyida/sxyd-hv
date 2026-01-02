@@ -7,13 +7,13 @@
 #include <intrin.h>
 
 namespace hv {
-// NOTE: EPT self-hide is experimental and can easily destabilize unload/startup on new kernels.
-// Keep it disabled by default while debugging stability/performance issues.
+// EPT self-hide is experimental and can destabilize startup/unload on new kernels.
+// Default: disabled.
 #ifndef HV_ENABLE_EPT_SELF_HIDE
 #define HV_ENABLE_EPT_SELF_HIDE 1
 #endif
 
-// NOTE: EPT hide for shared-queue is also experimental:
+// EPT hide for shared-queue is also experimental:
 // it remaps user pages to a dummy page in EPT when the owning CR3 is not running.
 // Default: disabled.
 #ifndef HV_ENABLE_EPT_SHARED_QUEUE_HIDE
@@ -34,8 +34,7 @@ extern "C" volatile LONG g_hv_vmxoff_cpu_count = 0;
 
 extern "C" {
 
-// function prototype doesn't really matter
-// since we never call these functions anyways
+// Only used for signature/byte-pattern scanning (we take the address; we don't call them).
 NTKERNELAPI void PsGetCurrentThreadProcess();
 NTKERNELAPI void PsGetProcessImageFileName();
 extern "C" IMAGE_DOS_HEADER __ImageBase;
@@ -63,7 +62,7 @@ static uint32_t generate_pool_tag() {
 
 // dynamically find the offsets for various kernel structures
 static bool find_offsets() {
-  // TODO: maybe dont hardcode this...
+  // TODO: derive these offsets per build (PDB/symbols or more robust pattern scanning).
   ghv.kprocess_directory_table_base_offset = 0x28;
   ghv.kpcr_pcrb_offset                     = 0x180;
   ghv.kprcb_current_thread_offset          = 0x8;
@@ -239,7 +238,7 @@ bool start() {
     auto const orig_affinity = KeSetSystemAffinityThreadEx(1ull << i);
 
     if (!virtualize_cpu(&ghv.vcpus[i])) {
-      // TODO: handle this bruh -_-
+      // TODO: unwind already-virtualized CPUs and free allocations before returning failure.
       KeRevertToUserAffinityThreadEx(orig_affinity);
       return false;
     }

@@ -603,8 +603,8 @@ void handle_host_interrupt(trap_frame* const frame) {
   }
 }
 
-// virtualize the specified cpu. this assumes that execution is already
-// restricted to the desired logical proocessor.
+// Virtualize the specified CPU. This assumes execution is already restricted
+// to the desired logical processor.
 bool virtualize_cpu(vcpu* const cpu) {
   memset(cpu, 0, sizeof(*cpu));
 
@@ -644,7 +644,7 @@ bool virtualize_cpu(vcpu* const cpu) {
 
   DbgPrint("[hv] Wrote VMCS fields.\n");
 
-  // TODO: should these fields really be set here? lol
+  // Initialize per-VCPU runtime state (explicit for clarity).
   cpu->ctx                       = nullptr;
   cpu->queued_nmis               = 0;
   cpu->tsc_offset                = 0;

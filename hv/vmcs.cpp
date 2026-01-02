@@ -28,7 +28,6 @@ void write_vmcs_ctrl_fields(vcpu* const cpu) {
   // NOTE: CR3 load exiting is extremely expensive on Windows (context switches) and
   // can destabilize the system if the handler isn't perfect. Keep it disabled by default.
   proc_based_ctrl.cr3_load_exiting            = 0;
-  //proc_based_ctrl.cr3_store_exiting           = 0;
   // Do NOT VM-exit on RDTSC/RDTSCP by default:
   // it's extremely hot on Windows and will cause severe slowdowns (especially under nested virtualization).
   // If you really want it for experiments, compile with HV_RDTSC_EXITING.

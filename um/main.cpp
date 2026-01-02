@@ -13,9 +13,9 @@
 static void usage(char const* const exe) {
   printf("usage:\n");
   printf("  %s --menu         # interactive menu (recommended)\n", exe);
-  printf("  %s --devirt-all    # run hypercall_unload on every CPU (useful before unloading hv.sys when EPT self-hide is enabled)\n", exe);
+  printf("  %s --devirt-all    # request global devirtualization via shared-queue (useful before unloading hv.sys when EPT self-hide is enabled)\n", exe);
   printf("  %s --demo          # run the shared-queue demo (legacy behavior)\n", exe);
-  printf("  %s --bench-tsc     # benchmark hypercall latency using RDTSC/RDTSCP\n", exe);
+  printf("  %s --bench-tsc     # benchmark CPUID-handshake latency using RDTSC/RDTSCP\n", exe);
   printf("  %s --diag-tsc      # dump recent TSC compensation diagnostics via shared-queue (no hypercall)\n", exe);
   printf("  %s --check-hide    # check whether hv.sys EPT self-hide works, and whether shared-queue pages are hidden from other CR3\n", exe);
   printf("  %s --help\n", exe);
@@ -41,13 +41,6 @@ static void action_ping() {
     return;
   auto const sig = hv::ping();
   printf("[um] ping => 0x%llX\n", sig);
-}
-
-static void action_test() {
-  if (!ensure_hv_running())
-    return;
-  auto const r = hv::test(1, 2, 3, 4, 5, 6);
-  printf("[um] test => 0x%llX\n", r);
 }
 
 struct bench_stats {
@@ -144,37 +137,13 @@ static void action_diag_tsc() {
   if (!ensure_hv_running())
     return;
 
-  // Register a shared queue (2 pages) so we can issue shared-queue commands.
-  constexpr size_t queue_size = 0x2000;
-  uint8_t* queue = static_cast<uint8_t*>(
-    VirtualAlloc(nullptr, queue_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-
-  if (!queue) {
-    printf("[um][err] VirtualAlloc failed (gle=0x%08X).\n", GetLastError());
-    return;
-  }
-
-  if (!VirtualLock(queue, queue_size)) {
-    printf("[um][err] VirtualLock failed (gle=0x%08X).\n", GetLastError());
-    VirtualFree(queue, 0, MEM_RELEASE);
-    return;
-  }
-
-  memset(queue, 0, queue_size);
-
-  hv::queue_handshake_request req{};
-  req.queue = queue;
-  req.size  = static_cast<uint32_t>(queue_size);
-  req.magic = 0xD1A6D1A6D1A6D1A6ull;
-  req.seed  = 0xF00DF00DF00DF00Dull;
-
-  auto const hs = hv::queue_handshake(req);
-  if (hs.signature != hv::hypervisor_signature ||
-      hs.status != hv::queue_register_status::success) {
-    printf("[um][err] queue handshake failed: signature=0x%llX status=%u pages=%u\n",
-      hs.signature, static_cast<uint32_t>(hs.status), hs.page_count);
-    VirtualUnlock(queue, queue_size);
-    VirtualFree(queue, 0, MEM_RELEASE);
+  hv::shared_queue_session sq;
+  if (!sq.open(/*queue_size=*/0x2000, /*magic=*/0xD1A6D1A6D1A6D1A6ull, /*seed=*/0xF00DF00DF00DF00Dull)) {
+    auto const hs = sq.last_handshake();
+    printf("[um][err] shared-queue open failed: signature=0x%llX status=%u pages=%u\n",
+      static_cast<unsigned long long>(hs.signature),
+      static_cast<uint32_t>(hs.status),
+      hs.page_count);
     return;
   }
 
@@ -184,50 +153,25 @@ static void action_diag_tsc() {
     VirtualAlloc(nullptr, out_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
   if (!out) {
     printf("[um][err] VirtualAlloc(out) failed (gle=0x%08X).\n", GetLastError());
-    VirtualUnlock(queue, queue_size);
-    VirtualFree(queue, 0, MEM_RELEASE);
     return;
   }
   memset(out, 0, out_size);
 
-  auto* qhdr = hv::sq_header(queue);
-  auto* qent = hv::sq_entries(queue);
-  qhdr->head = 0;
-  qhdr->tail = 0;
+  hv::shared_queue_entry e{};
+  e.cmd  = static_cast<uint32_t>(hv::shared_queue_cmd::tsc_diag_dump);
+  e.gva  = reinterpret_cast<uint64_t>(out);
+  e.size = out_size;
 
-  ZeroMemory(&qent[0], sizeof(hv::shared_queue_entry));
-  qent[0].cmd    = static_cast<uint32_t>(hv::shared_queue_cmd::tsc_diag_dump);
-  qent[0].status = static_cast<uint32_t>(hv::shared_queue_entry_status::pending);
-  qent[0].gva    = reinterpret_cast<uint64_t>(out);
-  qent[0].size   = out_size;
-
-  _mm_mfence();
-  qhdr->head = 1;
-  _mm_mfence();
-
-  // Kick HV: any VM-exit will process the queue batch.
-  int regs[4] = {};
-  __cpuid(regs, 0);
-
-  // Wait for completion (best-effort; kick periodically).
-  for (int i = 0; i < 2000; ++i) {
-    if (qent[0].status != static_cast<uint32_t>(hv::shared_queue_entry_status::pending))
-      break;
-    if ((i % 50) == 0)
-      __cpuid(regs, 0);
-    Sleep(0);
-  }
-
-  if (qent[0].status != static_cast<uint32_t>(hv::shared_queue_entry_status::done)) {
-    printf("[um][err] diag dump not completed (status=0x%08X).\n", qent[0].status);
+  if (!sq.submit(e)) {
+    printf("[um][err] diag dump not completed (status=0x%08X).\n", e.status);
   } else {
     auto const* hdr = reinterpret_cast<hv::tsc_diag_dump_header const*>(out);
     printf("[um][diag] tsc_diag_dump: newest_seq=%llu count=%u entry_size=%u (aux=%llu newest=%llu)\n",
       static_cast<unsigned long long>(hdr->newest_seq),
       hdr->count,
       hdr->entry_size,
-      static_cast<unsigned long long>(qent[0].aux),
-      static_cast<unsigned long long>(qent[0].reserved));
+      static_cast<unsigned long long>(e.aux),
+      static_cast<unsigned long long>(e.reserved));
 
     if (hdr->count == 0) {
       // Keep this message ASCII-only to avoid mojibake on non-UTF8 consoles.
@@ -259,56 +203,19 @@ static void action_diag_tsc() {
   }
 
   VirtualFree(out, 0, MEM_RELEASE);
-
-  // Best-effort deregister (avoid CR3/page reuse issues).
-  hv::queue_handshake_request dereg{};
-  dereg.queue = nullptr;
-  dereg.size  = 0;
-  dereg.magic = req.magic;
-  dereg.seed  = req.seed;
-  __try {
-    (void)hv::queue_handshake(dereg);
-  } __except (EXCEPTION_EXECUTE_HANDLER) {}
-
-  VirtualUnlock(queue, queue_size);
-  VirtualFree(queue, 0, MEM_RELEASE);
 }
 
 static void action_diag_exits() {
   if (!ensure_hv_running())
     return;
 
-  // Register a shared queue (2 pages) so we can issue shared-queue commands.
-  constexpr size_t queue_size = 0x2000;
-  uint8_t* queue = static_cast<uint8_t*>(
-    VirtualAlloc(nullptr, queue_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-
-  if (!queue) {
-    printf("[um][err] VirtualAlloc failed (gle=0x%08X).\n", GetLastError());
-    return;
-  }
-
-  if (!VirtualLock(queue, queue_size)) {
-    printf("[um][err] VirtualLock failed (gle=0x%08X).\n", GetLastError());
-    VirtualFree(queue, 0, MEM_RELEASE);
-    return;
-  }
-
-  memset(queue, 0, queue_size);
-
-  hv::queue_handshake_request req{};
-  req.queue = queue;
-  req.size  = static_cast<uint32_t>(queue_size);
-  req.magic = 0xE17157A7E17157A7ull;
-  req.seed  = 0x5151515151515151ull;
-
-  auto const hs = hv::queue_handshake(req);
-  if (hs.signature != hv::hypervisor_signature ||
-      hs.status != hv::queue_register_status::success) {
-    printf("[um][err] queue handshake failed: signature=0x%llX status=%u pages=%u\n",
-      hs.signature, static_cast<uint32_t>(hs.status), hs.page_count);
-    VirtualUnlock(queue, queue_size);
-    VirtualFree(queue, 0, MEM_RELEASE);
+  hv::shared_queue_session sq;
+  if (!sq.open(/*queue_size=*/0x2000, /*magic=*/0xE17157A7E17157A7ull, /*seed=*/0x5151515151515151ull)) {
+    auto const hs = sq.last_handshake();
+    printf("[um][err] shared-queue open failed: signature=0x%llX status=%u pages=%u\n",
+      static_cast<unsigned long long>(hs.signature),
+      static_cast<uint32_t>(hs.status),
+      hs.page_count);
     return;
   }
 
@@ -318,47 +225,20 @@ static void action_diag_exits() {
     VirtualAlloc(nullptr, out_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
   if (!out) {
     printf("[um][err] VirtualAlloc(out) failed (gle=0x%08X).\n", GetLastError());
-    VirtualUnlock(queue, queue_size);
-    VirtualFree(queue, 0, MEM_RELEASE);
     return;
   }
   memset(out, 0, out_size);
 
-  auto* qhdr = hv::sq_header(queue);
-  auto* qent = hv::sq_entries(queue);
-  qhdr->head = 0;
-  qhdr->tail = 0;
-
   auto do_dump = [&](hv::exit_stats_dump& dst) -> bool {
     memset(out, 0, out_size);
-    qhdr->head = 0;
-    qhdr->tail = 0;
 
-    ZeroMemory(&qent[0], sizeof(hv::shared_queue_entry));
-    qent[0].cmd    = static_cast<uint32_t>(hv::shared_queue_cmd::exit_stats_dump);
-    qent[0].status = static_cast<uint32_t>(hv::shared_queue_entry_status::pending);
-    qent[0].gva    = reinterpret_cast<uint64_t>(out);
-    qent[0].size   = out_size;
+    hv::shared_queue_entry e{};
+    e.cmd  = static_cast<uint32_t>(hv::shared_queue_cmd::exit_stats_dump);
+    e.gva  = reinterpret_cast<uint64_t>(out);
+    e.size = out_size;
 
-    _mm_mfence();
-    qhdr->head = 1;
-    _mm_mfence();
-
-    // Kick HV: any VM-exit will process the queue batch.
-    int regs[4] = {};
-    __cpuid(regs, 0);
-
-    // Wait for completion (best-effort; kick periodically).
-    for (int i = 0; i < 2000; ++i) {
-      if (qent[0].status != static_cast<uint32_t>(hv::shared_queue_entry_status::pending))
-        break;
-      if ((i % 50) == 0)
-        __cpuid(regs, 0);
-      Sleep(0);
-    }
-
-    if (qent[0].status != static_cast<uint32_t>(hv::shared_queue_entry_status::done)) {
-      printf("[um][err] exit stats dump not completed (status=0x%08X).\n", qent[0].status);
+    if (!sq.submit(e)) {
+      printf("[um][err] exit stats dump not completed (status=0x%08X).\n", e.status);
       return false;
     }
 
@@ -369,8 +249,6 @@ static void action_diag_exits() {
   hv::exit_stats_dump a{}, b{};
   if (!do_dump(a)) {
     VirtualFree(out, 0, MEM_RELEASE);
-    VirtualUnlock(queue, queue_size);
-    VirtualFree(queue, 0, MEM_RELEASE);
     return;
   }
 
@@ -379,8 +257,6 @@ static void action_diag_exits() {
 
   if (!do_dump(b)) {
     VirtualFree(out, 0, MEM_RELEASE);
-    VirtualUnlock(queue, queue_size);
-    VirtualFree(queue, 0, MEM_RELEASE);
     return;
   }
 
@@ -427,19 +303,6 @@ static void action_diag_exits() {
   }
 
   VirtualFree(out, 0, MEM_RELEASE);
-
-  // Best-effort deregister.
-  hv::queue_handshake_request dereg{};
-  dereg.queue = nullptr;
-  dereg.size  = 0;
-  dereg.magic = req.magic;
-  dereg.seed  = req.seed;
-  __try {
-    (void)hv::queue_handshake(dereg);
-  } __except (EXCEPTION_EXECUTE_HANDLER) {}
-
-  VirtualUnlock(queue, queue_size);
-  VirtualFree(queue, 0, MEM_RELEASE);
 }
 
 static void action_devirt_all() {
@@ -449,55 +312,31 @@ static void action_devirt_all() {
   printf("[um] Requesting global devirtualization via shared queue...\n");
   fflush(stdout);
 
-  // Allocate a small shared queue (2 pages) and register it via CPUID handshake.
-  constexpr size_t queue_size = 0x2000;
-  uint8_t* queue = static_cast<uint8_t*>(
-    VirtualAlloc(nullptr, queue_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-
-  if (!queue) {
-    printf("[um][err] VirtualAlloc failed (gle=0x%08X).\n", GetLastError());
+  hv::shared_queue_session sq;
+  if (!sq.open()) {
+    auto const hs = sq.last_handshake();
+    printf("[um][err] shared-queue open failed: signature=0x%llX status=%u pages=%u\n",
+      static_cast<unsigned long long>(hs.signature),
+      static_cast<uint32_t>(hs.status),
+      hs.page_count);
     return;
   }
 
-  if (!VirtualLock(queue, queue_size)) {
-    printf("[um][err] VirtualLock failed (gle=0x%08X).\n", GetLastError());
-    VirtualFree(queue, 0, MEM_RELEASE);
-    return;
+  {
+    auto const hs = sq.last_handshake();
+    printf("[um] queue handshake: signature=0x%llX status=%u pages=%u magic_echo=0x%llX\n",
+      static_cast<unsigned long long>(hs.signature),
+      static_cast<uint32_t>(hs.status),
+      hs.page_count,
+      static_cast<unsigned long long>(hs.echoed_magic));
   }
 
-  memset(queue, 0, queue_size);
-
-  hv::queue_handshake_request req{};
-  req.queue = queue;
-  req.size  = static_cast<uint32_t>(queue_size);
-  req.magic = 0xC0FFEE123456789ull;
-  req.seed  = 0xBADF00DCAFEBABEull;
-
-  auto const hs = hv::queue_handshake(req);
-  printf("[um] queue handshake: signature=0x%llX status=%u pages=%u magic_echo=0x%llX\n",
-    hs.signature, static_cast<uint32_t>(hs.status), hs.page_count, hs.echoed_magic);
-
-  if (hs.signature != hv::hypervisor_signature ||
-      hs.status != hv::queue_register_status::success) {
-    printf("[um][err] handshake failed.\n");
-    VirtualUnlock(queue, queue_size);
-    VirtualFree(queue, 0, MEM_RELEASE);
+  hv::shared_queue_entry e{};
+  e.cmd = static_cast<uint32_t>(hv::shared_queue_cmd::devirt_all);
+  if (!sq.submit(e)) {
+    printf("[um][err] devirt_all not completed (status=0x%08X).\n", e.status);
     return;
   }
-
-  // Enqueue a single "devirt_all" command.
-  auto* qhdr = hv::sq_header(queue);
-  auto* qent = hv::sq_entries(queue);
-  qhdr->head = 0;
-  qhdr->tail = 0;
-
-  ZeroMemory(&qent[0], sizeof(hv::shared_queue_entry));
-  qent[0].cmd    = static_cast<uint32_t>(hv::shared_queue_cmd::devirt_all);
-  qent[0].status = static_cast<uint32_t>(hv::shared_queue_entry_status::pending);
-
-  _mm_mfence();
-  qhdr->head = 1;
-  _mm_mfence();
 
   // Kick all CPUs to force immediate VM-exits and complete devirtualization deterministically.
   // Rationale:
@@ -506,14 +345,6 @@ static void action_devirt_all() {
   // - on multi-core (and especially in idle), waiting for timers can race with driver unload.
   printf("[um] Forcing a VM-exit on each CPU (CPUID) to complete devirtualization...\n");
   fflush(stdout);
-
-  // Kick current CPU first to ensure the queue is processed and stop is requested.
-  {
-    auto const ks = hv::queue_handshake(req);
-    printf("[um] kick result: signature=0x%llX status=%u pages=%u magic_echo=0x%llX\n",
-      ks.signature, static_cast<uint32_t>(ks.status), ks.page_count, ks.echoed_magic);
-    fflush(stdout);
-  }
 
   // Then force at least one VM-exit on every CPU.
   hv::for_each_cpu([&](uint32_t cpu_idx) {
@@ -548,9 +379,6 @@ static void action_devirt_all() {
 
   printf("[um] Requested. Now stop/unload hv.sys via SCM. Keep this program running until done.\n");
   wait_enter();
-
-  VirtualUnlock(queue, queue_size);
-  VirtualFree(queue, 0, MEM_RELEASE);
 }
 
 static int action_shared_queue_demo() {
@@ -559,178 +387,63 @@ static int action_shared_queue_demo() {
     return 0;
   }
 
-  // 1) Allocate & lock a shared queue buffer (example: 8KB).
-  constexpr size_t queue_size = 0x2000;
-  printf("[um] allocating queue size=0x%zx bytes.\n", queue_size);
-  uint8_t* queue = static_cast<uint8_t*>(
-    VirtualAlloc(nullptr, queue_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-
-  if (!queue) {
-    printf("[um][err] failed to allocate shared queue (gle=0x%08X).\n", GetLastError());
+  hv::shared_queue_session sq;
+  if (!sq.open()) {
+    auto const hs = sq.last_handshake();
+    printf("[um][err] shared-queue open failed: signature=%llX status=%u pages=%u\n",
+      static_cast<unsigned long long>(hs.signature),
+      static_cast<uint32_t>(hs.status),
+      hs.page_count);
     printf("Press Enter to exit.\n");
     getchar();
     return 0;
   }
 
-  if (!VirtualLock(queue, queue_size)) {
-    printf("[um][err] VirtualLock failed (gle=0x%08X).\n", GetLastError());
-    VirtualFree(queue, 0, MEM_RELEASE);
-    printf("Press Enter to exit.\n");
-    getchar();
-    return 0;
+  {
+    auto const hs = sq.last_handshake();
+    printf("[um] queue handshake: signature=%llX status=%u pages=%u magic_echo=%llX\n",
+      static_cast<unsigned long long>(hs.signature),
+      static_cast<uint32_t>(hs.status),
+      hs.page_count,
+      static_cast<unsigned long long>(hs.echoed_magic));
   }
 
-  // Touch pages to avoid lazy allocation.
-  memset(queue, 0xA5, queue_size);
-
-  // 2) Register via CPUID handshake.
-  printf("[um] queue ptr=%p\n", queue);
-  fflush(stdout);
-  hv::queue_handshake_request req{};
-  req.queue = queue;
-  req.size  = static_cast<uint32_t>(queue_size);
-  req.magic = 0xC0FFEE123456789ull;
-  req.seed  = 0xBADF00DCAFEBABEull;
-
-  printf("[um] sending handshake... magic=%llX seed=%llX\n", req.magic, req.seed);
-  fflush(stdout);
-  hv::queue_handshake_result hs{};
-  __try {
-    hs = hv::queue_handshake(req);
-  } __except (EXCEPTION_EXECUTE_HANDLER) {
-    printf("[um][err] handshake threw exception: 0x%08X\n", GetExceptionCode());
-    VirtualUnlock(queue, queue_size);
-    VirtualFree(queue, 0, MEM_RELEASE);
-    printf("Press Enter to exit.\n");
-    getchar();
+  // 1) Validate queue consumption with a NOP
+  hv::shared_queue_entry nop{};
+  nop.cmd = static_cast<uint32_t>(hv::shared_queue_cmd::nop);
+  if (!sq.submit(nop)) {
+    printf("[um][err] nop not completed (status=0x%08X).\n", nop.status);
+    wait_enter();
     return 0;
   }
+  printf("[um] nop done.\n");
 
-  printf("[um] queue handshake: signature=%llX status=%u pages=%u magic_echo=%llX\n",
-    hs.signature, static_cast<uint32_t>(hs.status), hs.page_count, hs.echoed_magic);
-  fflush(stdout);
-
-  if (hs.signature != hv::hypervisor_signature ||
-      hs.status != hv::queue_register_status::success) {
-    printf("[um][err] handshake failed, abort.\n");
-    VirtualUnlock(queue, queue_size);
-    VirtualFree(queue, 0, MEM_RELEASE);
-    printf("Press Enter to exit.\n");
-    getchar();
+  // 2) Small virt write/read demo using plain user buffers (not queue memory)
+  constexpr size_t scratch_size = 0x1000;
+  auto* scratch = static_cast<uint8_t*>(
+    VirtualAlloc(nullptr, scratch_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+  if (!scratch) {
+    printf("[um][err] VirtualAlloc(scratch) failed (gle=0x%08X).\n", GetLastError());
+    wait_enter();
     return 0;
   }
+  ZeroMemory(scratch, scratch_size);
 
-  // TODO: Hook more producer logic here (fill descriptors, advance head, etc).
-
-  printf("[um] handshake OK, continuing to hide HV pages...\n");
-  fflush(stdout);
-
-  // 3) Publish a NOP entry to validate queue consumption.
-  auto* qhdr = hv::sq_header(queue);
-  auto* qent = hv::sq_entries(queue);
-  qhdr->head = 0;
-  qhdr->tail = 0;
-
-  // Reserve a scratch area inside the queue (page #2) for read/write buffers.
-  uint8_t* scratch = reinterpret_cast<uint8_t*>(reinterpret_cast<uint8_t*>(queue) + 0x1000);
-  ZeroMemory(scratch, 0x200);
-
-  // Clear the first entry to avoid 0xA5 pattern affecting logs.
-  ZeroMemory(&qent[0], sizeof(hv::shared_queue_entry));
-  qent[0].cmd    = static_cast<uint32_t>(hv::shared_queue_cmd::nop);
-  qent[0].status = static_cast<uint32_t>(hv::shared_queue_entry_status::pending);
-  qent[0].size   = 0;
-  qent[0].flags  = 0;
-  qent[0].aux    = 0;
-
-  // Publish head=1
-  _mm_mfence();
-  qhdr->head = 1;
-  _mm_mfence();
-
-  // 4) Prepare virt test buffers
-  auto* virt_src = scratch + 0x100; // 0x80 bytes
-  auto* virt_dst = scratch + 0x180; // 0x80 bytes
+  auto* virt_src  = scratch + 0x100;
+  auto* virt_dst  = scratch + 0x200;
+  auto* virt_dst2 = scratch + 0x300;
   for (size_t i = 0; i < 0x80; ++i)
     virt_src[i] = static_cast<uint8_t>(i);
   ZeroMemory(virt_dst, 0x80);
-
-  // write_virt: src=virt_src (current), dst=virt_dst (same cr3)
-  ZeroMemory(&qent[1], sizeof(hv::shared_queue_entry));
-  qent[1].cmd    = static_cast<uint32_t>(hv::shared_queue_cmd::write_virt);
-  qent[1].status = static_cast<uint32_t>(hv::shared_queue_entry_status::pending);
-  qent[1].cr3    = 0; // 0 = current CR3
-  qent[1].gva    = reinterpret_cast<uint64_t>(virt_dst); // dst VA
-  qent[1].gpa    = reinterpret_cast<uint64_t>(virt_src); // src VA
-  qent[1].size   = 0x80;
-
-  // read_virt: src=virt_dst (target), dst=virt_dst2 (current)
-  auto* virt_dst2 = scratch + 0x200; // 0x80 bytes
   ZeroMemory(virt_dst2, 0x80);
 
-  ZeroMemory(&qent[2], sizeof(hv::shared_queue_entry));
-  qent[2].cmd    = static_cast<uint32_t>(hv::shared_queue_cmd::read_virt);
-  qent[2].status = static_cast<uint32_t>(hv::shared_queue_entry_status::pending);
-  qent[2].cr3    = 0; // current CR3
-  qent[2].gva    = reinterpret_cast<uint64_t>(virt_dst);  // src VA
-  qent[2].gpa    = reinterpret_cast<uint64_t>(virt_dst2); // dst VA
-  qent[2].size   = 0x80;
-
-  _mm_mfence();
-  qhdr->head = 3; // publish 3 entries (nop + write_virt + read_virt)
-  _mm_mfence();
-
-  // In some environments (nested/VMware), the VMX preemption timer may be unstable,
-  // causing no new VM-exits to poll the shared queue. Do a "kick" by repeating the
-  // CPUID handshake to force a VM-exit and process the queue promptly.
-  {
-    printf("[um] kicking HV to process queue...\n");
-    fflush(stdout);
-    __try {
-      auto const ks = hv::queue_handshake(req);
-      printf("[um] kick result: signature=%llX status=%u pages=%u magic_echo=%llX\n",
-        ks.signature, static_cast<uint32_t>(ks.status), ks.page_count, ks.echoed_magic);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-      printf("[um][warn] kick threw exception: 0x%08X\n", GetExceptionCode());
-    }
-    fflush(stdout);
-  }
-
-  // Poll tail to verify consumption.
-  while (!GetAsyncKeyState(VK_RETURN)) {
-    static bool entry0_reported = false;
-    static bool entry1_reported = false;
-    static bool entry2_reported = false;
-    auto const tail = qhdr->tail;
-    if (!entry0_reported &&
-        tail > 0 &&
-        qent[0].status == static_cast<uint32_t>(hv::shared_queue_entry_status::done)) {
-      printf("[um] queue entry 0 done, tail=%u\n", tail);
-      entry0_reported = true;
-    }
-    if (!entry1_reported &&
-        tail > 1 &&
-        qent[1].status == static_cast<uint32_t>(hv::shared_queue_entry_status::done)) {
-      printf("[um] queue entry 1 done (write_virt) tail=%u size=%u\n", tail, qent[1].size);
-      entry1_reported = true;
-    }
-    if (!entry2_reported &&
-        tail > 2 &&
-        qent[2].status == static_cast<uint32_t>(hv::shared_queue_entry_status::done)) {
-      printf("[um] queue entry 2 done (read_virt) tail=%u size=%u\n", tail, qent[2].size);
-      printf("[um] read_virt buffer (first 32 bytes):\n  ");
-      for (size_t i = 0; i < 32; ++i) {
-        printf("%02X ", virt_dst2[i]);
-      }
-      printf("\n");
-      entry2_reported = true;
-    }
-
-    if (entry0_reported && entry1_reported && entry2_reported)
-      break;
-
-    Sleep(200);
-  }
+  auto const w = sq.write_virtual(/*target_cr3=*/0, virt_dst, virt_src, 0x80);
+  auto const r = sq.read_virtual(/*target_cr3=*/0, virt_dst2, virt_dst, 0x80);
+  printf("[um] write_virtual=%zu read_virtual=%zu\n", w, r);
+  printf("[um] read_virt buffer (first 32 bytes):\n  ");
+  for (size_t i = 0; i < 32; ++i)
+    printf("%02X ", virt_dst2[i]);
+  printf("\n");
 
   // 5) Validate whether EPT self-hide is effective:
   // NOTE: shared-queue read_virt reads physical memory in root-mode and does NOT go through EPT,
@@ -740,50 +453,24 @@ static int action_shared_queue_demo() {
   if (find_loaded_driver("hv.sys", hv_base, hv_size)) {
     printf("[um] hv.sys base=%p size=0x%X\n", hv_base, hv_size);
 
-    ZeroMemory(&qent[3], sizeof(hv::shared_queue_entry));
-    qent[3].cmd    = static_cast<uint32_t>(hv::shared_queue_cmd::query_ept_map);
-    qent[3].status = static_cast<uint32_t>(hv::shared_queue_entry_status::pending);
-    qent[3].cr3    = 0; // current guest CR3
-    qent[3].gva    = reinterpret_cast<uint64_t>(hv_base); // kernel VA
-
-    _mm_mfence();
-    qhdr->head = 4;
-    _mm_mfence();
-
-    // wait for entry 3
-    for (int i = 0; i < 50; ++i) { // ~10s
-      if (qhdr->tail > 3 &&
-          qent[3].status == static_cast<uint32_t>(hv::shared_queue_entry_status::done)) {
-        auto const orig_pfn  = qent[3].gpa;
-        auto const mapped_pfn = qent[3].aux;
-        auto const dummy_pfn  = qent[3].reserved;
-        printf("[um] EPT map for hv.sys base: orig_pfn=0x%llX mapped_pfn=0x%llX dummy_pfn=0x%llX\n",
-          orig_pfn, mapped_pfn, dummy_pfn);
-        if (dummy_pfn != 0 && mapped_pfn == dummy_pfn)
-          printf("[um][ok] EPT self-hide effective (mapped to dummy).\n");
-        else
-          printf("[um][warn] EPT self-hide NOT effective for this VA (not mapped to dummy).\n");
-        break;
-      }
-      Sleep(200);
+    hv::shared_queue_entry q{};
+    q.cmd = static_cast<uint32_t>(hv::shared_queue_cmd::query_ept_map);
+    q.cr3 = 0;
+    q.gva = reinterpret_cast<uint64_t>(hv_base);
+    if (sq.submit(q)) {
+      auto const orig_pfn   = q.gpa;
+      auto const mapped_pfn = q.aux;
+      auto const dummy_pfn  = q.reserved;
+      printf("[um] EPT map for hv.sys base: orig_pfn=0x%llX mapped_pfn=0x%llX dummy_pfn=0x%llX\n",
+        orig_pfn, mapped_pfn, dummy_pfn);
+    } else {
+      printf("[um][warn] EPT map query failed (status=0x%08X).\n", q.status);
     }
   } else {
     printf("[um][warn] failed to locate hv.sys in loaded module list; skip self-hide check.\n");
   }
 
-  // 6) Deregister the shared queue before exit to avoid CR3/page reuse issues.
-  hv::queue_handshake_request dereg{};
-  dereg.queue = nullptr;
-  dereg.size  = 0;
-  dereg.magic = req.magic;
-  dereg.seed  = req.seed;
-  __try {
-    auto const dr = hv::queue_handshake(dereg);
-    printf("[um] queue deregister: signature=%llX status=%u pages=%u magic_echo=%llX\n",
-      dr.signature, static_cast<uint32_t>(dr.status), dr.page_count, dr.echoed_magic);
-  } __except (EXCEPTION_EXECUTE_HANDLER) {
-    printf("[um][warn] deregister threw exception: 0x%08X\n", GetExceptionCode());
-  }
+  VirtualFree(scratch, 0, MEM_RELEASE);
 
   printf("[um] exiting.\n");
   fflush(stdout);
@@ -812,76 +499,6 @@ static bool set_affinity_cpu(uint32_t cpu_idx) {
   return true;
 }
 
-static bool alloc_and_register_queue(uint8_t*& queue, size_t const queue_size, hv::queue_handshake_request& req) {
-  queue = static_cast<uint8_t*>(
-    VirtualAlloc(nullptr, queue_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-  if (!queue) {
-    printf("[um][err] VirtualAlloc failed (gle=0x%08X).\n", GetLastError());
-    return false;
-  }
-  if (!VirtualLock(queue, queue_size)) {
-    printf("[um][err] VirtualLock failed (gle=0x%08X).\n", GetLastError());
-    VirtualFree(queue, 0, MEM_RELEASE);
-    queue = nullptr;
-    return false;
-  }
-  memset(queue, 0xA5, queue_size);
-
-  req = {};
-  req.queue = queue;
-  req.size  = static_cast<uint32_t>(queue_size);
-  req.magic = 0xC0FFEE123456789ull;
-  req.seed  = 0xBADF00DCAFEBABEull;
-
-  hv::queue_handshake_result hs{};
-  __try {
-    hs = hv::queue_handshake(req);
-  } __except (EXCEPTION_EXECUTE_HANDLER) {
-    printf("[um][err] handshake threw exception: 0x%08X\n", GetExceptionCode());
-    VirtualUnlock(queue, queue_size);
-    VirtualFree(queue, 0, MEM_RELEASE);
-    queue = nullptr;
-    return false;
-  }
-
-  if (hs.signature != hv::hypervisor_signature ||
-      hs.status != hv::queue_register_status::success) {
-    printf("[um][err] handshake failed: signature=%llX status=%u pages=%u\n",
-      hs.signature, static_cast<uint32_t>(hs.status), hs.page_count);
-    VirtualUnlock(queue, queue_size);
-    VirtualFree(queue, 0, MEM_RELEASE);
-    queue = nullptr;
-    return false;
-  }
-
-  return true;
-}
-
-static void deregister_and_free_queue(uint8_t* queue, size_t const queue_size, hv::queue_handshake_request const& req) {
-  if (queue) {
-    hv::queue_handshake_request dereg{};
-    dereg.queue = nullptr;
-    dereg.size  = 0;
-    dereg.magic = req.magic;
-    dereg.seed  = req.seed;
-    __try { (void)hv::queue_handshake(dereg); } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    VirtualUnlock(queue, queue_size);
-    VirtualFree(queue, 0, MEM_RELEASE);
-  }
-}
-
-static bool sq_wait_done(hv::shared_queue_header* qhdr, hv::shared_queue_entry* ent, uint32_t idx, uint32_t timeout_ms) {
-  DWORD waited = 0;
-  while (waited < timeout_ms) {
-    if (qhdr->tail > idx &&
-        ent[idx].status == static_cast<uint32_t>(hv::shared_queue_entry_status::done))
-      return true;
-    Sleep(10);
-    waited += 10;
-  }
-  return false;
-}
-
 // Child: run on a specific CPU, register a queue for THIS process, and check whether the given PFN
 // is mapped to the dummy page in the current VCPU's EPT.
 static int action_check_queue_hidden(uint64_t const target_pfn, uint32_t const cpu_idx) {
@@ -891,44 +508,31 @@ static int action_check_queue_hidden(uint64_t const target_pfn, uint32_t const c
   if (!set_affinity_cpu(cpu_idx))
     return 1;
 
-  constexpr size_t queue_size = 0x2000;
-  uint8_t* queue = nullptr;
-  hv::queue_handshake_request req{};
-  if (!alloc_and_register_queue(queue, queue_size, req))
-    return 1;
-
-  auto* qhdr = hv::sq_header(queue);
-  auto* qent = hv::sq_entries(queue);
-  qhdr->head = 0;
-  qhdr->tail = 0;
-
-  ZeroMemory(&qent[0], sizeof(hv::shared_queue_entry));
-  qent[0].cmd    = static_cast<uint32_t>(hv::shared_queue_cmd::query_ept_gpa);
-  qent[0].status = static_cast<uint32_t>(hv::shared_queue_entry_status::pending);
-  qent[0].gpa    = (target_pfn << 12); // target GPA
-
-  _mm_mfence();
-  qhdr->head = 1;
-  _mm_mfence();
-
-  // Kick to ensure VM-exit
-  __try { (void)hv::queue_handshake(req); } __except (EXCEPTION_EXECUTE_HANDLER) {}
-
-  if (!sq_wait_done(qhdr, qent, 0, 2000)) {
-    printf("[um][child][err] query_ept_gpa timeout.\n");
-    deregister_and_free_queue(queue, queue_size, req);
+  hv::shared_queue_session sq;
+  if (!sq.open()) {
+    auto const hs = sq.last_handshake();
+    printf("[um][child][err] shared-queue open failed: signature=%llX status=%u pages=%u\n",
+      static_cast<unsigned long long>(hs.signature),
+      static_cast<uint32_t>(hs.status),
+      hs.page_count);
     return 1;
   }
 
-  auto const orig_pfn   = qent[0].gpa;
-  auto const mapped_pfn = qent[0].aux;
-  auto const dummy_pfn  = qent[0].reserved;
+  hv::shared_queue_entry e{};
+  e.cmd = static_cast<uint32_t>(hv::shared_queue_cmd::query_ept_gpa);
+  e.gpa = (target_pfn << 12);
+  if (!sq.submit(e)) {
+    printf("[um][child][err] query_ept_gpa failed (status=0x%08X).\n", e.status);
+    return 1;
+  }
+
+  auto const orig_pfn   = e.gpa;
+  auto const mapped_pfn = e.aux;
+  auto const dummy_pfn  = e.reserved;
   bool const hidden = (dummy_pfn != 0 && mapped_pfn == dummy_pfn);
 
   printf("[um][child] target_pfn=0x%llX => ept_mapped_pfn=0x%llX dummy_pfn=0x%llX => hidden=%s\n",
     orig_pfn, mapped_pfn, dummy_pfn, hidden ? "true" : "false");
-
-  deregister_and_free_queue(queue, queue_size, req);
   return hidden ? 0 : 2;
 }
 
@@ -941,36 +545,29 @@ static int action_check_hide() {
   if (!set_affinity_cpu(cpu_idx))
     return 1;
 
-  constexpr size_t queue_size = 0x2000;
-  uint8_t* queue = nullptr;
-  hv::queue_handshake_request req{};
-  if (!alloc_and_register_queue(queue, queue_size, req))
+  hv::shared_queue_session sq;
+  if (!sq.open()) {
+    auto const hs = sq.last_handshake();
+    printf("[um][err] shared-queue open failed: signature=%llX status=%u pages=%u\n",
+      static_cast<unsigned long long>(hs.signature),
+      static_cast<uint32_t>(hs.status),
+      hs.page_count);
     return 1;
-
-  auto* qhdr = hv::sq_header(queue);
-  auto* qent = hv::sq_entries(queue);
-  qhdr->head = 0;
-  qhdr->tail = 0;
+  }
 
   // 1) hv.sys self-hide check (same as demo)
   void* hv_base = nullptr;
   uint32_t hv_size = 0;
   if (find_loaded_driver("hv.sys", hv_base, hv_size)) {
-    ZeroMemory(&qent[0], sizeof(hv::shared_queue_entry));
-    qent[0].cmd    = static_cast<uint32_t>(hv::shared_queue_cmd::query_ept_map);
-    qent[0].status = static_cast<uint32_t>(hv::shared_queue_entry_status::pending);
-    qent[0].cr3    = 0;
-    qent[0].gva    = reinterpret_cast<uint64_t>(hv_base);
+    hv::shared_queue_entry map{};
+    map.cmd = static_cast<uint32_t>(hv::shared_queue_cmd::query_ept_map);
+    map.cr3 = 0;
+    map.gva = reinterpret_cast<uint64_t>(hv_base);
 
-    _mm_mfence();
-    qhdr->head = 1;
-    _mm_mfence();
-    __try { (void)hv::queue_handshake(req); } __except (EXCEPTION_EXECUTE_HANDLER) {}
-
-    if (sq_wait_done(qhdr, qent, 0, 2000)) {
-      auto const orig_pfn   = qent[0].gpa;
-      auto const mapped_pfn = qent[0].aux;
-      auto const dummy_pfn  = qent[0].reserved;
+    if (sq.submit(map)) {
+      auto const orig_pfn   = map.gpa;
+      auto const mapped_pfn = map.aux;
+      auto const dummy_pfn  = map.reserved;
 
       // IMPORTANT:
       // In "read-hide/exec-ok" mode (EPT hook toggling), the *current* mapped_pfn depends on
@@ -979,55 +576,42 @@ static int action_check_hide() {
       printf("[um] hv.sys EPT (current): orig_pfn=0x%llX mapped_pfn=0x%llX dummy_pfn=0x%llX\n",
         orig_pfn, mapped_pfn, dummy_pfn);
 
-      ZeroMemory(&qent[1], sizeof(hv::shared_queue_entry));
-      qent[1].cmd    = static_cast<uint32_t>(hv::shared_queue_cmd::query_ept_hook_gpa);
-      qent[1].status = static_cast<uint32_t>(hv::shared_queue_entry_status::pending);
-      qent[1].gpa    = (orig_pfn << 12);
+      hv::shared_queue_entry hook{};
+      hook.cmd = static_cast<uint32_t>(hv::shared_queue_cmd::query_ept_hook_gpa);
+      hook.gpa = (orig_pfn << 12);
 
-      _mm_mfence();
-      qhdr->head = 2;
-      _mm_mfence();
-      __try { (void)hv::queue_handshake(req); } __except (EXCEPTION_EXECUTE_HANDLER) {}
-
-      if (sq_wait_done(qhdr, qent, 1, 2000)) {
-        auto const hooked_pfn = qent[1].gpa;
-        auto const hook_read  = qent[1].aux;
-        auto const hook_exec  = qent[1].reserved;
-        auto const hook_dummy = qent[1].cr3;
+      if (sq.submit(hook)) {
+        auto const hooked_pfn = hook.gpa;
+        auto const hook_read  = hook.aux;
+        auto const hook_exec  = hook.reserved;
+        auto const hook_dummy = hook.cr3;
         bool const hooked = (hook_read != 0 || hook_exec != 0);
         bool const self_hide = (hooked && hook_dummy != 0 && hook_read == hook_dummy);
         printf("[um] hv.sys EPT hook: hooked=%s hooked_pfn=0x%llX read_pfn=0x%llX exec_pfn=0x%llX dummy_pfn=0x%llX => self_hide=%s\n",
           hooked ? "true" : "false", hooked_pfn, hook_read, hook_exec, hook_dummy, self_hide ? "true" : "false");
       } else {
-        printf("[um][warn] hv.sys hook check timeout.\n");
+        printf("[um][warn] hv.sys hook check failed (status=0x%08X).\n", hook.status);
       }
     } else {
-      printf("[um][warn] hv.sys self-hide check timeout.\n");
+      printf("[um][warn] hv.sys self-hide check failed (status=0x%08X).\n", map.status);
     }
   } else {
     printf("[um][warn] failed to locate hv.sys; skip hv.sys self-hide check.\n");
   }
 
   // 2) Query PFN of OUR queue page via query_ept_map (so we can test it from a different CR3)
-  ZeroMemory(&qent[2], sizeof(hv::shared_queue_entry));
-  qent[2].cmd    = static_cast<uint32_t>(hv::shared_queue_cmd::query_ept_map);
-  qent[2].status = static_cast<uint32_t>(hv::shared_queue_entry_status::pending);
-  qent[2].cr3    = 0;
-  qent[2].gva    = reinterpret_cast<uint64_t>(queue);
+  hv::shared_queue_entry qmap{};
+  qmap.cmd = static_cast<uint32_t>(hv::shared_queue_cmd::query_ept_map);
+  qmap.cr3 = 0;
+  qmap.gva = reinterpret_cast<uint64_t>(sq.raw_queue());
 
-  _mm_mfence();
-  qhdr->head = 3;
-  _mm_mfence();
-  __try { (void)hv::queue_handshake(req); } __except (EXCEPTION_EXECUTE_HANDLER) {}
-
-  if (!sq_wait_done(qhdr, qent, 2, 2000)) {
-    printf("[um][err] failed to query queue PFN (timeout).\n");
-    deregister_and_free_queue(queue, queue_size, req);
+  if (!sq.submit(qmap)) {
+    printf("[um][err] failed to query queue PFN (status=0x%08X).\n", qmap.status);
     return 1;
   }
 
-  uint64_t const queue_pfn = qent[2].gpa; // orig PFN
-  printf("[um] queue base=%p => pfn=0x%llX\n", queue, queue_pfn);
+  uint64_t const queue_pfn = qmap.gpa; // orig PFN
+  printf("[um] queue base=%p => pfn=0x%llX\n", sq.raw_queue(), queue_pfn);
 
   // 3) Spawn a child process pinned to the same CPU to check whether that PFN is hidden
   char exe_path[MAX_PATH] = {};
@@ -1042,7 +626,6 @@ static int action_check_hide() {
   PROCESS_INFORMATION pi{};
   if (!CreateProcessA(nullptr, cmdline, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
     printf("[um][err] CreateProcess failed (gle=0x%08X).\n", GetLastError());
-    deregister_and_free_queue(queue, queue_size, req);
     return 1;
   }
 
@@ -1053,8 +636,6 @@ static int action_check_hide() {
   CloseHandle(pi.hProcess);
 
   printf("[um] child exit code=%lu (0=hidden, 2=not-hidden)\n", exit_code);
-
-  deregister_and_free_queue(queue, queue_size, req);
   return 0;
 }
 
@@ -1062,13 +643,12 @@ static void run_menu() {
   for (;;) {
     printf("\n========== hv um menu ==========\n");
     printf("1) ping (check if HV is running)\n");
-    printf("2) test (example hypercall)\n");
-    printf("3) shared-queue demo\n");
-    printf("4) devirt-all (run hypercall_unload on each CPU; use before unloading hv.sys when self-hide is enabled)\n");
-    printf("5) bench-tsc (measure hypercall latency via RDTSC/RDTSCP)\n");
-    printf("6) diag-tsc (dump TSC compensation diagnostics via shared-queue)\n");
-    printf("7) diag-exits (dump VM-exit/MSR statistics via shared-queue)\n");
-    printf("8) check-hide (hv.sys self-hide + shared-queue EPT hide check)\n");
+    printf("2) shared-queue demo\n");
+    printf("3) devirt-all (request global devirtualization via shared-queue; use before unloading hv.sys when self-hide is enabled)\n");
+    printf("4) bench-tsc (measure CPUID-handshake latency via RDTSC/RDTSCP)\n");
+    printf("5) diag-tsc (dump TSC compensation diagnostics via shared-queue)\n");
+    printf("6) diag-exits (dump VM-exit/MSR statistics via shared-queue)\n");
+    printf("7) check-hide (hv.sys self-hide + shared-queue EPT hide check)\n");
     printf("0) exit\n");
     printf("Select: ");
     fflush(stdout);
@@ -1093,29 +673,25 @@ static void run_menu() {
       wait_enter();
       break;
     case 2:
-      action_test();
-      wait_enter();
-      break;
-    case 3:
       action_shared_queue_demo();
       break;
-    case 4:
+    case 3:
       action_devirt_all();
       wait_enter();
       break;
-    case 5:
+    case 4:
       action_bench_tsc();
       wait_enter();
       break;
-    case 6:
+    case 5:
       action_diag_tsc();
       wait_enter();
       break;
-    case 7:
+    case 6:
       action_diag_exits();
       wait_enter();
       break;
-    case 8:
+    case 7:
       action_check_hide();
       wait_enter();
       break;
